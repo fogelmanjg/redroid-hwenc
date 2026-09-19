@@ -35,7 +35,7 @@ BlueStacks、Nox、MuMu 在 Linux 桌面上都没有真正的替代品。[redroi
 
 每个阶段都假设前一个阶段已经完成。⭐ 标记的是最关键、杠杆最大的检查点。
 
-- [ ] **阶段 0 — 纯调研。** 弄清楚 redroid/scrcpy 现在是怎么选择编码器的（是通过
+- [x] **阶段 0 — 纯调研。** 弄清楚 redroid/scrcpy 现在是怎么选择编码器的（是通过
       `MediaCodecList` 按能力匹配，还是写死了名字？）。确认真实硬件上有哪些 VA-API 编码
       entrypoint 可用（`VAEntrypointEncSlice`）。
 - [ ] **阶段 1 — 阅读与梳理。** Codec2 组件的结构（参考

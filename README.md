@@ -41,7 +41,7 @@ solve it in public, in increasing-difficulty tiers, documenting the process as i
 
 Each tier assumes the previous one is done. ⭐ marks the highest-leverage checkpoint.
 
-- [ ] **Tier 0 — Pure research.** How redroid/scrcpy pick the encoder today (via
+- [x] **Tier 0 — Pure research.** How redroid/scrcpy pick the encoder today (via
       `MediaCodecList` capability matching, or a hardcoded name?). Confirm which VA-API encode
       entrypoints (`VAEntrypointEncSlice`) are available on real hardware.
 - [ ] **Tier 1 — Reading/mapping.** Structure of a Codec2 component (using
