@@ -190,3 +190,36 @@ Next hardware to try: an NVIDIA GPU (4060), to see whether the same gap and fix 
 or whether NVIDIA's proprietary driver path changes anything in this part of the picture (it
 shouldn't — this fix is entirely on the Android/Codec2 side, before VA-API/the GPU driver even
 enters the picture — but worth confirming rather than assuming).
+
+## 2026-09-19 (same day) — NVIDIA: real architecture finding, plus an unrelated blocker
+
+Set up a fresh machine from scratch for this one: Docker CE, `nvidia-container-toolkit`
+(confirmed working — `docker run --gpus all ... nvidia-smi` succeeds inside a container), and
+`nvidia-vaapi-driver` (Debian packages it: `nvidia-vaapi-driver 0.0.13-1`).
+
+**Real finding, worth designing around now rather than discovering later:** unlike Mesa
+(AMD/Intel), which bundles VA-API encode support automatically, `nvidia-vaapi-driver` is
+**decode-only**. `vainfo` with it loaded lists plenty of decode profiles
+(H.264/HEVC/VP8/VP9/AV1, all `VAEntrypointVLD`) and **zero** `VAEntrypointEncSlice` entries. The
+RTX 4060 (Ada Lovelace) obviously has strong hardware encode — but it's exposed through NVENC,
+NVIDIA's own proprietary API, not through VA-API. This means the future hardware Codec2
+component (Tier 4/5) can't be a single VA-API backend for every vendor — it needs a vendor
+split: VA-API for AMD/Intel, a separate NVENC-based path for NVIDIA. Worth stating explicitly in
+the roadmap once Tier 1 starts taking real shape.
+
+**Unrelated blocker, not chased to a conclusion tonight:** redroid itself won't boot on this
+particular fresh install. `vold` and `blank_screen` — and only those two, both perfectly normal
+64-bit x86-64 PIE binaries with the same `/system/bin/linker64` interpreter as everything else —
+fail with `cannot execv(...): No such file or directory` moments after their process is forked,
+while `hwservicemanager`/`servicemanager` start fine. Reproduces identically with `--gpus all`
+removed and with `androidboot.redroid_gpu_mode=guest` (pure software rendering, no GPU
+dependency at all) — so it's not GPU/NVIDIA-toolkit related. Ruled out: image corruption (layer
+ID matches the source host exactly), binder device permissions (fixed a real `chmod 666` miss
+along the way, different bug, didn't fix this one), storage driver (identical overlay2-on-btrfs
+setup works fine on another machine), 32-bit/IA32 emulation (both binaries are 64-bit; kernel
+has `CONFIG_IA32_EMULATION=y` anyway), and container-level AppArmor confinement (profile is
+correctly `unconfined` for this `--privileged` container). Leading suspicion: a mount-namespace
+propagation quirk specific to this fresh Debian trixie + Docker 29.8.1 + containerd 2.3.5
+install, since both failing services do their own mount-namespace work at start. Not resolved —
+parking it here so the investigation isn't lost, separate from the (already answered) VA-API
+question above.
