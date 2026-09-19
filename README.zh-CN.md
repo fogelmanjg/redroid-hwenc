@@ -59,7 +59,10 @@ BlueStacks、Nox、MuMu 在 Linux 桌面上都没有真正的替代品。[redroi
 
 ## 目前进度
 
-刚刚起步。进度请看 [DEVLOG.md](DEVLOG.md)（英文），按会话逐次记录。
+阶段 0-2 已完成：找到并修复了 Codec2 缺少硬件编码支持的根本原因，已在 AMD/Intel/NVIDIA 上验证；
+一个独立的 VA-API H.264 编码器也已在真实硬件上端到端跑通（验证的是输出真正可解码，而不只是 API
+调用成功）。接下来是阶段 3——决定成败的关键验证：redroid 的 gralloc buffer 导出的 dma-buf 能否
+零拷贝导入到 VA-API surface。进度请看 [DEVLOG.md](DEVLOG.md)（英文），按会话逐次记录。
 
 ## 参与贡献
 

@@ -66,7 +66,11 @@ has been documented by anyone until now.
 
 ## Current status
 
-Just getting started. See [DEVLOG.md](DEVLOG.md) for real progress, session by session.
+Tiers 0-2 done: Codec2 hardware-encode gap root-caused and fixed across AMD/Intel/NVIDIA, and a
+standalone VA-API H.264 encoder proven working end to end on real hardware (verified decodable
+output, not just successful API calls). Tier 3 — the make-or-break check of whether a redroid
+gralloc buffer's dma-buf can be imported zero-copy into a VA-API surface — is next. See
+[DEVLOG.md](DEVLOG.md) for the real progress, session by session.
 
 ## Contributing
 

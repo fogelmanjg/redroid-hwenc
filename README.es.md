@@ -66,7 +66,12 @@ documentado por nadie hasta ahora.
 
 ## Estado actual
 
-Arrancando. Ver [DEVLOG.md](DEVLOG.md) (en inglés) para el progreso real, sesión a sesión.
+Tiers 0-2 resueltos: encontrada y arreglada la causa raíz de por qué Codec2 no tenía encode por
+hardware, validado en AMD/Intel/NVIDIA, y un encoder VA-API standalone de H.264 probado
+funcionando de punta a punta en hardware real (salida verificada como realmente decodificable, no
+solo llamadas de API exitosas). Sigue el Tier 3 — la verificación clave de si un buffer gralloc de
+redroid puede importarse zero-copy a una superficie VA-API. Ver [DEVLOG.md](DEVLOG.md) (en inglés)
+para el progreso real, sesión a sesión.
 
 ## Contribuir
 
