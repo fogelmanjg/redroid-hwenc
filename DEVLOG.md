@@ -509,3 +509,77 @@ to be confirmed hands-on in Tier 2/3.
 against VA-API instead of V4L2 ioctls" than "build an AOSP HAL component from a blank page." The
 real unknowns left are entirely inside that one class: the Tier 3 zero-copy import, and the
 VA-API rate-control/slice parameter details for H.264/HEVC.
+
+## 2026-09-19 (same day) — Tier 2: standalone VA-API encode works, but not on the first, second, or third try
+
+Built `tier2-vaapi-encode/main.c` — no Android, no redroid, just a C program that opens
+`/dev/dri/renderD128` on server01 (AMD Renoir APU, radeonsi driver, already confirmed working for
+`vainfo` back in Tier 0) and drives the encode side of VA-API directly: `vaCreateConfig` with
+`VAEntrypointEncSlice`, two surfaces (input + reconstructed), a context, sequence/picture/slice
+parameter buffers, `vaRenderPicture`, `vaSyncSurface`, then read the coded buffer back out and
+write it to a file. Exactly the call sequence mapped against `libva-utils` during Tier 1.
+
+**First cut "worked" (`VA_STATUS_SUCCESS` on every call, wrote a 49-byte file) but produced
+garbage.** `ffprobe`/`ffmpeg` both rejected it: "Invalid data found when processing input." The
+coded buffer contained a single NAL-shaped blob with no SPS, no PPS — just raw slice bytes. The
+driver does **not** synthesize parameter sets on its own; it only encodes what you explicitly hand
+it. This is the same class of gap the NVIDIA collaborator's spec doc (see below) also didn't
+anticipate — it's easy to assume "the driver just gives you an H.264 file" when actually VA-API's
+contract is much thinner than that.
+
+**Fix, part 1 — packed headers.** `va_enc_h264.h` documents `VAEncPackedHeaderSequence`/`Picture`/
+`Slice`: the application builds the SPS/PPS/slice-header RBSPs itself, byte for byte, and submits
+them via `VAEncPackedHeaderParameterBuffer` + `VAEncPackedHeaderDataBuffer` pairs. Wrote a minimal
+MSB-first bitstream writer from scratch (`bs_put_bit`/`bs_put_ue`/`bs_put_se`, Exp-Golomb per H.264
+spec 9.1) and hand-built the SPS and PPS RBSPs field-by-field, mirroring the same struct values
+already being sent as `VAEncSequenceParameterBufferH264`/`VAEncPictureParameterBufferH264` — the
+two have to be kept in sync by hand, there's no library doing this for you here.
+
+**That triggered a real crash, not a logic bug: `*** buffer overflow detected ***: terminated`
+inside `vaRenderPicture`.** No `gdb` on this box, so bisected with `printf`+`fflush` markers (first
+lesson: stdout was fully buffered since output was piped — `setvbuf(stdout, NULL, _IONBF, 0)` was
+needed just to see how far execution actually got before the abort ate the buffer). Narrowed it to
+the exact `vaRenderPicture` call — batching all 7 buffers (seq + packed-SPS pair + pic +
+packed-PPS pair + slice) into one call crashes this radeonsi driver. Splitting into one
+`vaRenderPicture` call per buffer "family" (matching the pattern real implementations use, not an
+arbitrary workaround) avoided that — but the *real* bug turned out to be one line up: the packed
+header data buffer is supposed to contain "the start code prefix 0x000001 followed by the complete
+NAL unit" per the header comment in `va_enc_h264.h` — the driver does not add the start code
+itself. Missing it wasn't just cosmetically wrong output, it was malformed enough to make the
+driver's own parsing overflow a fortified buffer. Once the start code was prepended, the crash
+was gone regardless of how the buffers were batched — so the batching split stayed as good
+practice, but the start-code omission was the actual root cause.
+
+**Fix, part 2 — the coded buffer still only had the raw slice, headerless, with an invalid
+`0x00` NAL header byte where a real IDR slice needs `0x65`.** Turned out CABAC slices need a third
+packed header: `VAEncPackedHeaderSlice`, containing the `slice_header()` syntax (not
+`slice_data()`, not `rbsp_trailing_bits()` — the driver's hardware entropy coder continues writing
+macroblock bits immediately after, non-byte-aligned, using the exact `bit_length` declared in the
+packed header parameter). Wrote `build_slice_header_bits()` covering the IDR/I-slice path only
+(`first_mb_in_slice`, `slice_type`, `frame_num`, `idr_pic_id`, the IDR form of
+`dec_ref_pic_marking()`, `slice_qp_delta`, deblocking params — skipping every P/B-only branch of
+7.3.3 since this prototype only ever emits one all-intra frame).
+
+**Once all three packed headers (SPS + PPS + slice header) were present, the driver's behavior
+changed completely** — not just "stopped crashing," but started actually synthesizing correct
+output: the coded buffer came back as *three* separate segments (SPS NAL, PPS NAL, properly
+headered `0x65` IDR slice NAL) instead of one broken blob. With packed SPS+PPS submitted but no
+packed slice header, the coded buffer was unchanged from the very first broken attempt — the
+driver silently no-ops on partial packed-header submissions rather than erroring or partially
+applying them. That's a sharp edge worth remembering: "some packed headers accepted, no error,
+but nothing happens" is a real failure mode here, not a hypothetical one.
+
+**Final result, confirmed both ways:** `ffprobe` reports a clean stream — `codec_name=h264`,
+`profile=Constrained Baseline`, `320x240`, `yuv420p` — and `ffmpeg -i out.h264 -f null -` decodes
+it with zero errors. Extracted the decoded frame back to raw grayscale and checked pixel values:
+the fed-in flat 128 came back as 130, exactly the kind of small rounding you'd expect from
+lossy quantization (QP 26) and in-loop deblocking on a real hardware encode — not a red flag, a
+sign the round-trip is genuinely doing lossy video compression rather than passing data through
+unchanged.
+
+**What this de-risks going into Tier 3:** the VA-API encode side is now proven working end to end
+on real AMD hardware, including the non-obvious parts (packed headers, the exact bitstream layout,
+the multi-call `vaRenderPicture` pattern). Tier 3 swaps the synthetic NV12 test surface for a
+dma-buf imported from a redroid Codec2 buffer (`VASurfaceAttribExternalBuffers` +
+`VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME`) — everything downstream of surface creation in this file
+carries over unchanged.

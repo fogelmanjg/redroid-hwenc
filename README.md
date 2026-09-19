@@ -48,7 +48,7 @@ Each tier assumes the previous one is done. ⭐ marks the highest-leverage check
       [`android_external_v4l2_codec2`](https://gitcode.com/pi-plus/android_external_v4l2_codec2)
       as a reference for the plumbing, not the hardware logic — that's V4L2, this is VA-API).
       The VA-API **encode** API surface (not decode).
-- [ ] **Tier 2 — Isolated native prototype.** Standalone program (host, no Android) that
+- [x] **Tier 2 — Isolated native prototype.** Standalone program (host, no Android) that
       encodes H.264 via VA-API over `/dev/dri/renderD*`.
 - [ ] **Tier 3 — ⭐ The make-or-break spike.** Does a gralloc buffer export a `dma-buf` fd that
       VA-API can import zero-copy, inside a container with the same privileges as redroid?

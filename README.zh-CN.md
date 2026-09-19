@@ -42,7 +42,7 @@ BlueStacks、Nox、MuMu 在 Linux 桌面上都没有真正的替代品。[redroi
       [`android_external_v4l2_codec2`](https://gitcode.com/pi-plus/android_external_v4l2_codec2)
       的代码结构，而不是它的硬件逻辑——那是 V4L2，这里用的是 VA-API）。VA-API **编码**
       （而非解码）部分的 API 接口。
-- [ ] **阶段 2 — 独立的原生原型。** 一个独立程序（跑在宿主机上，不涉及 Android），
+- [x] **阶段 2 — 独立的原生原型。** 一个独立程序（跑在宿主机上，不涉及 Android），
       通过 `/dev/dri/renderD*` 用 VA-API 编码 H.264。
 - [ ] **阶段 3 — ⭐ 决定成败的关键验证。** gralloc buffer 导出的 `dma-buf` fd，能不能在
       和 redroid 权限相同的容器里被 VA-API 零拷贝导入？四年的 issue 里似乎没人验证过这一点。

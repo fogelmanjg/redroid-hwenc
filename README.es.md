@@ -48,7 +48,7 @@ Cada tier asume que el anterior está resuelto. El ⭐ marca el checkpoint de ma
       [`android_external_v4l2_codec2`](https://gitcode.com/pi-plus/android_external_v4l2_codec2)
       como referencia de plomería, no de lógica de hardware — eso es V4L2, acá va VA-API).
       Superficie de API de **encode** VA-API (no decode).
-- [ ] **Tier 2 — Prototipo nativo aislado.** Programa standalone (host, sin Android) que
+- [x] **Tier 2 — Prototipo nativo aislado.** Programa standalone (host, sin Android) que
       encodea H.264 vía VA-API sobre `/dev/dri/renderD*`.
 - [ ] **Tier 3 — ⭐ El spike que decide todo.** ¿Un buffer gralloc exporta un `dma-buf` fd que
       VA-API pueda importar zero-copy, dentro de un contenedor con los mismos privilegios que
