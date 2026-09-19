@@ -1,20 +1,20 @@
 # Devlog
 
-Registro sesión a sesión — qué se probó, qué anduvo, qué no, y por qué. Ver el roadmap por
-tiers en el [README](README.md).
+Session-by-session log — what was tried, what worked, what didn't, and why. See the [README](README.md)
+for the tier-based roadmap.
 
-## 2026-09-19 — Arranque
+## 2026-09-19 — Kickoff
 
-Repo creado. El roadmap de 6 tiers viene de investigar el estado real del problema: los issues
-oficiales de redroid-doc (#126, #172, #168, #535) llevan entre 1 y 4 años abiertos, todos con la
-misma respuesta del maintainer ("los drivers VA-API ya están, el componente Codec2 lo tenés que
-escribir vos") y ningún resultado publicado.
+Repo created. The 6-tier roadmap comes from actually investigating the state of the problem: the
+official redroid-doc issues (#126, #172, #168, #535) have been open between 1 and 4 years, all
+with the same answer from the maintainer ("the VA-API drivers are already there, you write the
+Codec2 component") and no published result.
 
-Punto de partida importante que cambia el cálculo de dificultad respecto a lo que la comunidad
-parece asumir: redroid corre como contenedor Docker privilegiado, no como VM. Eso significa que
-no hay virtio-gpu de por medio en el límite del contenedor — el kernel/DRM es literalmente el
-del host. El spike del Tier 3 (¿un buffer gralloc exporta un dma-buf que VA-API importe
-zero-copy?) parte de mejor posición que si redroid corriera virtualizado.
+Important starting point that changes the difficulty calculus relative to what the community
+seems to assume: redroid runs as a privileged Docker container, not a VM. That means there's no
+virtio-gpu in the way at the container boundary — the kernel/DRM is literally the host's. The
+Tier 3 spike (does a gralloc buffer export a dma-buf that VA-API can import zero-copy?) starts
+from a better position than if redroid ran virtualized.
 
-Próximo paso: Tier 0 — confirmar cómo redroid/scrcpy eligen el encoder hoy, y qué entrypoints de
-encode VA-API soporta el hardware real que se va a usar.
+Next step: Tier 0 — confirm how redroid/scrcpy pick the encoder today, and which VA-API encode
+entrypoints the real hardware actually supports.

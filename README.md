@@ -1,73 +1,79 @@
 # redroid-hwenc
 
-Encoder de video por hardware (H.264/H.265, vía VA-API) para [redroid](https://github.com/remote-android/redroid-doc).
+**Languages:** English | [Español](README.es.md) | [中文](README.zh-CN.md)
 
-## El problema
+> This project's official language is **English**. The other language files are provided for
+> convenience and may not be perfectly accurate or up to date — if in doubt, this file is the
+> source of truth.
 
-BlueStacks, Nox y MuMu no tienen equivalente real en Linux desktop. [redroid](https://github.com/remote-android/redroid-doc)
-es lo más cercano — Android corriendo en un contenedor Docker, con GPU passthrough para el
-renderizado — pero el streaming de esa pantalla (scrcpy, o cualquier consumo de video dentro de
-una app Android) sigue cayendo en un **encoder de software puro**
-(`OMX.google.h264.encoder` / `c2.android.avc.encoder`). `gpuMode=host` acelera el renderizado
-(OpenGL/Vulkan vía Mesa), nunca el encoder.
+Hardware video encoding (H.264/H.265, via VA-API) for [redroid](https://github.com/remote-android/redroid-doc).
 
-Este pedido lleva **abierto desde 2022** en el repo oficial, sin que nadie lo haya resuelto y
-publicado:
+## The problem
+
+BlueStacks, Nox and MuMu have no real equivalent on Linux desktop. [redroid](https://github.com/remote-android/redroid-doc)
+is the closest thing — Android running in a Docker container, with GPU passthrough for
+rendering — but streaming that screen (scrcpy, or any video consumed inside an Android app)
+still falls back to a **pure software encoder**
+(`OMX.google.h264.encoder` / `c2.android.avc.encoder`). `gpuMode=host` accelerates rendering
+(OpenGL/Vulkan via Mesa), never the encoder.
+
+This request has been **open since 2022** in the official repo, with nobody having solved and
+published a fix:
 
 - [remote-android/redroid-doc#126](https://github.com/remote-android/redroid-doc/issues/126) — AMD VA-API (OMX/Codec2)
-- [remote-android/redroid-doc#172](https://github.com/remote-android/redroid-doc/issues/172) — mismo pedido, AMD
-- [remote-android/redroid-doc#168](https://github.com/remote-android/redroid-doc/issues/168) — mismo pedido, Intel
-- [remote-android/redroid-doc#535](https://github.com/remote-android/redroid-doc/issues/535) — pedido de H.265, comentario de septiembre 2025 sin respuesta
+- [remote-android/redroid-doc#172](https://github.com/remote-android/redroid-doc/issues/172) — same request, AMD
+- [remote-android/redroid-doc#168](https://github.com/remote-android/redroid-doc/issues/168) — same request, Intel
+- [remote-android/redroid-doc#535](https://github.com/remote-android/redroid-doc/issues/535) — H.265 request, unanswered comment from September 2025
 
-El maintainer del proyecto (`zhouziyang`) siempre contesta lo mismo: los drivers VA-API ya están
-empaquetados en redroid, pero el componente Codec2/OMX que los use para encodear queda como
-tarea para la comunidad. En 4 años, nadie lo terminó y publicó.
+The project maintainer (`zhouziyang`) always gives the same answer: the VA-API drivers are
+already bundled in redroid, but the Codec2/OMX component that actually uses them for encoding is
+left as a task for the community. In 4 years, nobody finished it and shipped it.
 
-## Por qué ahora
+## Why now
 
-No es que sea imposible — es que la intersección de "le importa este problema específico" y
-"está dispuesto a meterse en AOSP/Codec2/VA-API" es rara. La mayoría de la gente en esos issues
-son usuarios pidiendo el feature, no gente dispuesta a escribirlo. Este repo es el intento de
-resolverlo en público, en tiers de dificultad creciente, documentando el proceso a medida que
-avanza (ver [DEVLOG.md](DEVLOG.md)).
+It's not that it's impossible — it's that the intersection of "cares about this specific
+problem" and "is willing to dig into AOSP/Codec2/VA-API" is rare. Most people in those issues
+are users asking for the feature, not people willing to write it. This repo is an attempt to
+solve it in public, in increasing-difficulty tiers, documenting the process as it goes (see
+[DEVLOG.md](DEVLOG.md)).
 
-## Roadmap (por dificultad, no por tiempo)
+## Roadmap (by difficulty, not by time)
 
-Cada tier asume que el anterior está resuelto. El ⭐ marca el checkpoint de mayor apalancamiento.
+Each tier assumes the previous one is done. ⭐ marks the highest-leverage checkpoint.
 
-- [ ] **Tier 0 — Investigación pura.** Cómo redroid/scrcpy eligen el encoder hoy (¿por
-      capacidad vía `MediaCodecList`, o nombre hardcodeado?). Confirmar entrypoints de encode
-      VA-API disponibles (`VAEntrypointEncSlice`) en el host real.
-- [ ] **Tier 1 — Lectura/mapeo.** Estructura de un componente Codec2 (tomando
+- [ ] **Tier 0 — Pure research.** How redroid/scrcpy pick the encoder today (via
+      `MediaCodecList` capability matching, or a hardcoded name?). Confirm which VA-API encode
+      entrypoints (`VAEntrypointEncSlice`) are available on real hardware.
+- [ ] **Tier 1 — Reading/mapping.** Structure of a Codec2 component (using
       [`android_external_v4l2_codec2`](https://gitcode.com/pi-plus/android_external_v4l2_codec2)
-      como referencia de plomería, no de lógica de hardware — eso es V4L2, acá va VA-API). Superficie
-      de API de **encode** VA-API (no decode).
-- [ ] **Tier 2 — Prototipo nativo aislado.** Programa standalone (host, sin Android) que
-      encodea H.264 vía VA-API sobre `/dev/dri/renderD*`.
-- [ ] **Tier 3 — ⭐ El spike que decide todo.** ¿Un buffer gralloc exporta un `dma-buf` fd que
-      VA-API pueda importar zero-copy, dentro de un contenedor con los mismos privilegios que
-      redroid? Nadie lo confirmó en 4 años de issues. redroid corre como contenedor (no VM) — sin
-      virtio-gpu de por medio, mejor punto de partida del que la comunidad asume.
-- [ ] **Tier 4 — Esqueleto Codec2 en Android.** Componente que Android reconoce y lista
-      (`dumpsys media.c2`) como `c2.hardware.encoder.h264`, sin encoding real todavía.
-- [ ] **Tier 5 — Integración real.** Tier 3 + Tier 2 conectados dentro de los callbacks del
-      componente del Tier 4. El objetivo final.
-- [ ] **Tier 6 (condicional a Tier 0).** Si el selector de codec de redroid/scrcpy resulta estar
-      hardcodeado en vez de por capacidad: parchearlo.
+      as a reference for the plumbing, not the hardware logic — that's V4L2, this is VA-API).
+      The VA-API **encode** API surface (not decode).
+- [ ] **Tier 2 — Isolated native prototype.** Standalone program (host, no Android) that
+      encodes H.264 via VA-API over `/dev/dri/renderD*`.
+- [ ] **Tier 3 — ⭐ The make-or-break spike.** Does a gralloc buffer export a `dma-buf` fd that
+      VA-API can import zero-copy, inside a container with the same privileges as redroid?
+      Nobody confirmed this in 4 years of issues. redroid runs as a container (not a VM) — no
+      virtio-gpu in the way, a better starting point than the community seems to assume.
+- [ ] **Tier 4 — Codec2 skeleton in Android.** A component that Android recognizes and lists
+      (`dumpsys media.c2`) as `c2.hardware.encoder.h264`, without real encoding wired in yet.
+- [ ] **Tier 5 — Real integration.** Tier 3 + Tier 2 wired into the callbacks of the Tier 4
+      component. The actual goal.
+- [ ] **Tier 6 (conditional on Tier 0).** If redroid/scrcpy's codec selection turns out to be
+      hardcoded instead of capability-based: patch it.
 
-Cada tier, aunque no se llegue más lejos, ya es una contribución publicable — nada de esto quedó
-documentado por nadie hasta ahora.
+Even if it doesn't go further, each tier on its own is a publishable contribution — none of this
+has been documented by anyone until now.
 
-## Estado actual
+## Current status
 
-Arrancando. Ver [DEVLOG.md](DEVLOG.md) para el progreso real, sesión a sesión.
+Just getting started. See [DEVLOG.md](DEVLOG.md) for real progress, session by session.
 
-## Contribuir
+## Contributing
 
-Sin CLA, sin fricción — Apache-2.0 llano. Si te interesa este problema, un PR o un comentario en
-un issue vale más que pedir permiso primero.
+No CLA, no friction — plain Apache-2.0. If this problem interests you, a PR or a comment on an
+issue is worth more than asking for permission first.
 
-## Licencia
+## License
 
-Apache License 2.0 — ver [LICENSE](LICENSE). Misma licencia que AOSP (`frameworks/av`), a
-propósito: si algo de esto eventualmente vale la pena subirlo río arriba, no hay fricción legal.
+Apache License 2.0 — see [LICENSE](LICENSE). Same license as AOSP (`frameworks/av`), on
+purpose: if any of this is eventually worth upstreaming, there's no legal friction.
