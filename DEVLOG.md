@@ -165,3 +165,28 @@ of hitting the same "service present, zero components" dead end again.
 **Open question for later:** whether this needs to be set on every boot (boot script /
 `redroid.c2.sh` addition) or can be baked into `media_codecs.xml`/build config permanently.
 Not chased tonight — noting it so it isn't lost.
+
+## 2026-09-19 (same day) — Cross-hardware validation: AMD Vega APU → AMD Polaris discrete GPU
+
+Ran the exact same test on a second, different machine: an AMD Radeon RX 480 (Polaris10,
+discrete, not an APU), on a Debian 13 host with its own quirk — this kernel doesn't have
+`CONFIG_ANDROID_BINDERFS` compiled in at all (confirmed via `/boot/config-$(uname -r)`), unlike
+the first host. `binder_linux` was already loaded there with fixed legacy device nodes
+(`devices=binder,hwbinder,vndbinder,binder1,...,binder2,...` module parameter) instead of
+binderfs — an older-style setup. Used one of the two free legacy slots (a third was already in
+active use by a real running instance on that host; left it untouched).
+
+`vainfo` on this GPU: same result shape as the Vega APU — full H.264 (Baseline/Main/High) and
+HEVC Main hardware **encode** (`VAEntrypointEncSlice`).
+
+Applied the identical fix from the previous entry (`device_config put codec_fwk aidl_hal true`
++ `setprop media.c2.hal.selection aidl` + restart `media.swcodec`) on a disposable test instance
+on this second machine. **Identical result:** 0 → 32 components, same `c2.android.avc.encoder`
+and `c2.android.hevc.encoder`. This isn't a quirk of one particular AMD chip or kernel build —
+it's a generic redroid/AOSP build configuration gap, reproducible across an APU and a discrete
+GPU, two different kernels, two different binder setups (binderfs vs. legacy fixed nodes).
+
+Next hardware to try: an NVIDIA GPU (4060), to see whether the same gap and fix apply there too,
+or whether NVIDIA's proprietary driver path changes anything in this part of the picture (it
+shouldn't — this fix is entirely on the Android/Codec2 side, before VA-API/the GPU driver even
+enters the picture — but worth confirming rather than assuming).
