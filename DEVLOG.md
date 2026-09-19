@@ -338,3 +338,31 @@ config/env-var nudge. `gpuMode=guest` stays the practical fallback for NVIDIA ho
 meantime. Given the actual goal of this repo is encode (NVENC, unrelated to this rendering path),
 not full 3D acceleration, this doesn't block Tier 1+ — parking NVIDIA `gpuMode=host` as a
 separate, harder side quest rather than a blocker.
+
+## 2026-09-19 (same day) — Prior art exists, but it doesn't fit redroid's headless model
+
+Before assuming a HAL rewrite from scratch, searched for whether anyone solved the equivalent
+problem in a similar project. They have:
+[**waydroid-nvidia**](https://github.com/Shiro836/waydroid-nvidia) gets full GPU-accelerated
+Android-in-container on NVIDIA working — real, verified (Minecraft Bedrock, 2ms present-to-present
+latency benchmarks). The approach: proxy Vulkan (Mesa Venus) from the Android guest over a unix
+socket to a host-side renderer, allocate buffers host-side as NVIDIA block-linear images, and
+hand them to the consumer as native NVIDIA dmabufs — no cross-vendor EGL/gralloc negotiation at
+all, which is exactly the class of problem we hit.
+
+**The catch that matters for us:** this architecture requires a real Wayland compositor (KWin/
+Plasma, verified) already running on the host — the Android container renders *through* that
+existing desktop session, it isn't headless. That's the opposite of what `redroid-manager` is
+for (a host with nothing but Docker, no desktop session required). Porting this approach as-is
+would mean giving up headless operation specifically on NVIDIA hosts — a real, new constraint
+that doesn't exist for AMD/Intel today.
+
+Other requirements worth noting if this gets revisited: `nvidia-open`/`nvidia-open-dkms` kernel
+modules specifically (not the classic proprietary blob) — not yet confirmed which one is running
+on the test machines. Driver 595.71+ with `nvidia-drm.modeset=1`. Turing (RTX 20/GTX 16) or
+newer GPUs — the GTX 1050 Ti used for our tests is Pascal, older than what's verified to work;
+the RTX 4060 (Ada) would qualify. Separately, NVIDIA's developer forums note they don't build
+`nvidia-utils` against bionic libc — a known ABI friction point in this space generally, distinct
+from our specific bug but the same swampy territory.
+
+Not a drop-in fix, but the most concrete lead that exists for this specific problem today.
