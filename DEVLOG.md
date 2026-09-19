@@ -223,3 +223,66 @@ propagation quirk specific to this fresh Debian trixie + Docker 29.8.1 + contain
 install, since both failing services do their own mount-namespace work at start. Not resolved —
 parking it here so the investigation isn't lost, separate from the (already answered) VA-API
 question above.
+
+## 2026-09-19 (same day) — Hunted the boot blocker down: two missing host kernel modules, then the real NVIDIA issue
+
+Picked this back up on a second, independent fresh host (a GTX 1050 Ti machine, also a from-
+scratch Docker + nvidia-container-toolkit install) specifically to tell apart "quirk of one
+machine" from "something structural." Same crash, identical `cannot execv` signature. Confirmed
+this had nothing to do with Docker/containerd version either — downgraded to the exact versions
+running on the machine where redroid boots fine (Docker 29.7.2, containerd 2.3.3); crash
+persisted unchanged.
+
+The real trail was earlier in `dmesg`, above where the `execv` errors show up (easy to miss if
+you only grep for the visible symptom):
+
+```
+apexd-bootstrap: Failed to activate .../com.android.tzdata.apex: Could not create loop device
+  for .../com.android.tzdata.apex: Failed to open loop-control: No such device
+init: Service apexd-bootstrap has 'reboot_on_failure' option and failed, shutting down system.
+```
+
+`apexd-bootstrap` — the thing that mounts Android's APEX modules, itself a hard boot dependency
+— was failing because **the `loop` kernel module wasn't loaded on the host.** `/dev/loop-control`
+existed as a stale device node, but nothing backed it (`lsmod | grep loop` was empty), so opening
+it returned ENODEV. That failure trips `apexd-bootstrap`'s `reboot_on_failure`, which makes
+Android's init do its own internal soft-reboot — and it's numbers from a strictly worse state
+*after* that soft-reboot that produce the `vold`/`blank_screen` `execv` errors seen in the
+earlier entries. Those were downstream noise, not the cause.
+
+`modprobe loop` got loop devices created, but the APEX *mount* still failed
+(`Mounting failed for .../com.android.tzdata.apex: No such device`) — this time because
+**`ext4` wasn't registered as a filesystem in the kernel either** (`cat /proc/filesystems` had
+no `ext4` line at all, vs. a working host which listed it with `ext4`/`mbcache`/`jbd2` loaded).
+`modprobe ext4` fixed that too.
+
+With both modules loaded, redroid boots almost all the way: `vold`, `apexd`, `adbd`,
+`gpuservice`, the graphics composer service — all come up clean. **The actual remaining failure
+is now squarely an NVIDIA/Mesa incompatibility, not a host config gap:**
+
+```
+MESA: Using gralloc header from libdrm/android/gralloc_handle.h. [...] Initializing a fallback
+  gralloc as a helper: Using fallback gralloc implementation
+libc: Fatal signal 6 (SIGABRT) [...] in tid ... (surfaceflinger)
+  #03 SkiaGLRenderEngine::chooseEglConfig
+  #04 SkiaGLRenderEngine::create
+```
+
+redroid's own vendor gralloc (`gralloc.redroid.so`, built against Mesa/GBM assumptions) isn't
+being used — Mesa's client library falls back to a generic gralloc implementation instead, and
+SurfaceFlinger's Skia-based render engine then aborts trying to pick an EGL config against
+whatever that fallback actually hands it through NVIDIA's proprietary EGL/GL stack. This crashes
+`surfaceflinger` in a loop (`exited 4 times before boot completed`), which is why
+`sys.boot_completed` never gets set.
+
+**Where this leaves NVIDIA support:** it's not a missing package or a config flag this time — it's
+a real vendor HAL incompatibility between redroid's Mesa-oriented gralloc/hwcomposer and NVIDIA's
+driver stack. `gpuMode=guest` (pure software rendering, no GPU driver in the loop) should sidestep
+this entirely and is worth confirming as a fallback; getting `gpuMode=host` genuinely working on
+NVIDIA would mean either an NVIDIA-aware gralloc/hwcomposer HAL (nobody seems to have published
+one for redroid) or something narrower fixing just this EGL config negotiation — not yet
+investigated further.
+
+**Worth carrying back to `redroid-manager`'s Doctor, independent of the NVIDIA question:** missing
+`loop`/`ext4` kernel modules is a real, generic footgun for anyone deploying redroid on a host
+that's never needed them before — cheap, high-value checks to add.
