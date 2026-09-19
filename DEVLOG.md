@@ -395,3 +395,15 @@ touching AOSP source — safe to treat as solved and move on from.
 - NVIDIA (Ada 4060, Pascal 1050 Ti): `gpuMode=host` blocked on a real gralloc/EGL HAL
   incompatibility (separate side quest); `gpuMode=guest` works as a fallback; encode would need
   NVENC, not VA-API, regardless of the gralloc question.
+
+**Scope decision on NVIDIA (2026-09-19):** the crash isn't encoder-specific — it's in
+SurfaceFlinger's core render engine, so `gpuMode=host` on NVIDIA has no working 3D acceleration
+at all, and the system doesn't even finish booting there (not "everything works except encode",
+literally nothing boots). `gpuMode=guest` does boot, and since Codec2/MediaCodec encoders can
+consume plain `ByteBuffer` input (not just a GPU-native `Surface` — this is exactly the pattern
+`screenrecord`/scrcpy's own capture already uses), an NVENC-backed encoder could plausibly work
+on top of `gpuMode=guest` without needing the gralloc/EGL fix at all — one memcpy CPU→GPU instead
+of true zero-copy, but real hardware encode either way. Decided to still treat full `gpuMode=host`
+3D acceleration on NVIDIA as the real goal, not settle for guest-mode-only — without it, most
+APKs (especially games) won't run at acceptable performance. It stays a separate side project,
+doesn't block Tier 1+ on the main roadmap.
