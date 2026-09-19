@@ -366,3 +366,32 @@ the RTX 4060 (Ada) would qualify. Separately, NVIDIA's developer forums note the
 from our specific bug but the same swampy territory.
 
 Not a drop-in fix, but the most concrete lead that exists for this specific problem today.
+
+## 2026-09-19 (same day) — Intel iGPU: clean pass, confirms the AMD/Intel-vs-NVIDIA split
+
+Third GPU vendor, third architecture family: Intel Iris Xe (TigerLake-LP), integrated. Fresh
+machine, same drill as before (`modprobe loop ext4` up front this time, learned that lesson).
+
+**`gpuMode=host` boots clean, first try** — no gralloc/EGL crash at all, unlike NVIDIA. Confirms
+the earlier read: this is specifically an NVIDIA-vs-Mesa problem, not a general "any non-AMD GPU"
+problem. Intel, like AMD, goes through Mesa's real DRI/GBM path and redroid's own vendor gralloc
+handles it fine.
+
+**`vainfo` on the host:** rich H.264 (Main/High/ConstrainedBaseline) and HEVC support (Main/
+Main10/Main12/Main422/Main444, including SCC profiles) — broader HEVC coverage than the AMD
+hosts tested so far. One naming detail worth remembering for Tier 2: Intel reports the encode
+entrypoint as **`VAEntrypointEncSliceLP`** (low-power path), not `VAEntrypointEncSlice` like AMD.
+Any capability probe needs to check for both, not just one.
+
+**Codec2 `aidl_hal` fix confirmed a third time**, identical result to AMD APU and AMD discrete:
+0 → 32 components, `c2.android.avc.encoder` and `c2.android.hevc.encoder` present. Same fix,
+same mechanism, three completely different GPU vendors/architectures. This part of the roadmap
+(Tier 0's Codec2 registration prerequisite) is now about as validated as it can get without
+touching AOSP source — safe to treat as solved and move on from.
+
+**State of play across all vendors tested:**
+- AMD (Vega APU, Polaris discrete): full pass, `gpuMode=host` works, encode via VA-API.
+- Intel (Iris Xe): full pass, `gpuMode=host` works, encode via VA-API (`EncSliceLP`).
+- NVIDIA (Ada 4060, Pascal 1050 Ti): `gpuMode=host` blocked on a real gralloc/EGL HAL
+  incompatibility (separate side quest); `gpuMode=guest` works as a fallback; encode would need
+  NVENC, not VA-API, regardless of the gralloc question.
