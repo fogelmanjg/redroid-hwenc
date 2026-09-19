@@ -69,3 +69,53 @@ session.
 `debug.stagefright.ccodec` after a fresh boot to see whether Google's stock software Codec2
 components (e.g. `c2.android.avc.encoder`) show up. That's real signal on whether the Codec2
 path is viable here before touching Tier 1+.
+
+## 2026-09-19 (same day) — Tier 0 continued: Codec2 activates, but with an empty component list
+
+Booted a disposable throwaway instance (`redroid-jg-15:gapps-official`, not a production one)
+with `androidboot.use_redroid_c2=1` added to the boot command line.
+
+**The flag works exactly as found earlier.** After boot: `debug.stagefright.ccodec=4`,
+`ro.boot.use_redroid_c2=1`, and a real Codec2 AIDL service is registered and running:
+`android.hardware.media.c2.IComponentStore/software` (`service list` confirms it, backed by the
+stock `mediaswcodec` process from the `com.android.media.swcodec` APEX, which *is* present and
+mounted — full `libcodec2_soft_*.so` set for every standard codec, including
+`libcodec2_soft_avcenc.so`, and a complete, unmodified `media_codecs.xml` inside the APEX
+correctly declaring `c2.android.avc.encoder` with `<Alias name="OMX.google.h264.encoder" />`).
+Everything a stock Android 15 device would have is genuinely there.
+
+**But it reports zero components.** `dumpsys android.hardware.media.c2.IComponentStore/software`
+returns:
+
+```
+Supported components:
+    NONE
+Active components:
+    NONE
+```
+
+**Root cause, found in the service's own logcat (PID of `media.swcodec`):**
+
+```
+E CodecServiceRegistrant: listComponents -- not supported.
+```
+
+The AIDL `ComponentStore` starts fine and responds to `dump`, but the piece responsible for
+walking `media_codecs.xml` and actually registering each declared component
+(`CodecServiceRegistrant`) explicitly declines — not a crash, not a missing file, a deliberate
+"not supported" from `libmedia_codecserviceregistrant.so`. Only one copy of that library exists
+in the whole system (inside the swcodec APEX itself) — there's no device/vendor-specific
+registrant overriding it. Reading this as: this AOSP fork ships the generic/default registrant
+stub and never wires a real one, so the software Codec2 store — despite being 100% present and
+otherwise correctly configured — never actually exposes any component to the rest of the
+framework.
+
+This is one layer *before* the hardware question. Before a hardware Codec2 component (Tier 4)
+can matter, the basic software Codec2 path needs a working `CodecServiceRegistrant`. Worth
+checking whether this is specific to this particular build/lunch target, or a general redroid
+(or even AOSP-without-a-real-device) gap — and whether AOSP's `frameworks/av` has a usable
+generic registrant implementation that just isn't linked in, or whether one needs to be written.
+
+**Next step:** find (or write) a working `CodecServiceRegistrant` implementation and confirm the
+software Codec2 path actually lists components end to end — that's the real prerequisite for
+Tier 4, more fundamental than originally scoped.
