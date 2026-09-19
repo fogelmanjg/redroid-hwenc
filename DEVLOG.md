@@ -429,3 +429,83 @@ Weaker than the discrete GPU for heavy 3D, but real hardware acceleration instea
 
 **Doesn't apply to plain AMD Ryzen desktop CPUs without the "G" suffix** (3600, 5600X, 5700X,
 non-G 7000-series, etc.) — those have no integrated graphics at all, nothing to fall back to.
+
+## 2026-09-19 (same day) — Tier 1: mapped the Codec2 component structure, and Tier 3 got a lot less scary
+
+Read `android_external_v4l2_codec2` in detail (LineageOS's mirror, current AOSP-tracking fork —
+`components/`, `service/`, `plugin_store/`). The goal was to extract the *structure*, not the
+V4L2 logic itself. Turned out to split much more cleanly than expected into "generic C2 glue"
+(fully reusable) vs. "the one thing that's actually backend-specific" (has to be written fresh
+for VA-API).
+
+**Service registration — a direct, tiny template.** `service/service.cpp` is ~50 lines: build a
+`ComponentStore`, wrap it in `aidl::...::utils::ComponentStore`, register it with
+`AServiceManager_addService()` under an instance name (`IComponentStore/default` in this
+example — matches exactly the `IComponentStore/software` naming we saw registered for the stock
+software store back in the Tier 0 investigation). Comes with its own `.rc` (start the service as
+a `hal`-class process) and a VINTF manifest `.xml` fragment declaring the AIDL instance exists —
+this `.xml` is the missing piece that would need adding to redroid's own device manifest for a
+future hardware store to be *declared*, the same gate that `IsCodec2AidlHalSelected()` checks
+before wiring up the real store instead of the null one.
+
+**`ComponentStore.cpp` — generic, not V4L2-specific at all.** Implements the standard
+`C2ComponentStore` interface (`createComponent`, `createInterface`, `listComponents`, etc.) plus
+a small `Builder` (`.encoder(name, codec, factory)` / `.decoder(...)`) to declare components. None
+of this cares what's behind the factory — directly reusable as-is for a VA-API-backed store.
+
+**`EncodeComponent.cpp` (1078 lines) is almost entirely reusable too.** It's the C2/Android-facing
+glue — `queue_nb`, the work queue, block pool management, reporting work back to the framework —
+and it never touches V4L2 directly. It drives an abstract `VideoEncoder` interface instead.
+
+**The actual backend-specific surface turned out to be small and precise — `VideoEncoder.h`:**
+
+```cpp
+virtual bool encode(std::unique_ptr<InputFrame> buffer) = 0;
+virtual void drain() = 0;
+virtual void flush() = 0;
+virtual bool setBitrate(uint32_t bitrate) = 0;
+virtual bool setPeakBitrate(uint32_t peakBitrate) = 0;
+virtual bool setFramerate(uint32_t framerate) = 0;
+virtual void requestKeyframe() = 0;
+```
+
+plus three simple getters. That's the entire contract a VA-API backend needs to implement —
+everything upstream of it (interface param validation, work queue, block pool, service
+registration) is reusable structure, not backend-specific.
+
+**Tier 3's question got answered halfway, as a side effect.** `InputFrame` already carries raw
+file descriptors + per-plane stride/offset, and `EncodeComponent.cpp` shows exactly where they
+come from — a completely standard, already-shipped AOSP pattern, not something exotic to
+reverse-engineer:
+
+```cpp
+const C2Handle* const handle = block.handle();
+for (int i = 0; i < handle->numFds; i++) {
+    fds.emplace_back(handle->data[i]);
+}
+```
+
+A `C2ConstGraphicBlock`'s native handle just *is* a small struct of file descriptors — for a
+gralloc buffer backed by dma-buf, `handle->data[i]` are the dma-buf fds directly, no special
+mapper call needed. V4L2 hands these straight to `VIDIOC_QBUF` with `V4L2_MEMORY_DMABUF`. This
+narrows Tier 3 down to specifically: does `vaCreateSurfaces` with
+`VASurfaceAttribExternalBuffers` (`VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME`) accept *this exact* fd
+as a valid VA-API surface — the "does redroid's own gralloc produce something VA-API-importable"
+question — not "how do I even get a dma-buf fd out of Android's buffer system" (solved, stock
+AOSP, verified against shipped code).
+
+**VA-API encode call sequence, confirmed against the canonical reference**
+(`intel/libva-utils`, `encode/h264encode.c`): `vaCreateConfig` (profile +
+`VAEntrypointEncSlice`/`VAEntrypointEncSliceLP`) → `vaCreateSurfaces` → `vaCreateContext` → per
+frame: build `VAEncSequenceParameterBufferH264`/`VAEncPictureParameterBufferH264`/
+`VAEncSliceParameterBufferH264` buffers, `vaRenderPicture` each, bracket with
+`vaBeginPicture`/`vaEndPicture`, then `vaSyncSurface` + `vaMapBuffer` on the coded buffer to read
+the bitstream out. This basic example allocates its own surfaces internally rather than importing
+external ones — the external-buffer/PRIME-import variant needed for Tier 3 isn't shown here, still
+to be confirmed hands-on in Tier 2/3.
+
+**Where this leaves Tier 4/5:** looking a lot more like "port `ComponentStore.cpp` + `service.cpp`
++ `EncodeInterface.cpp` with light renaming, write one new class implementing `VideoEncoder`
+against VA-API instead of V4L2 ioctls" than "build an AOSP HAL component from a blank page." The
+real unknowns left are entirely inside that one class: the Tier 3 zero-copy import, and the
+VA-API rate-control/slice parameter details for H.264/HEVC.

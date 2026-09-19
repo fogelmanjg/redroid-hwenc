@@ -44,7 +44,7 @@ Cada tier asume que el anterior está resuelto. El ⭐ marca el checkpoint de ma
 - [x] **Tier 0 — Investigación pura.** Cómo redroid/scrcpy eligen el encoder hoy (¿por
       capacidad vía `MediaCodecList`, o nombre hardcodeado?). Confirmar entrypoints de encode
       VA-API disponibles (`VAEntrypointEncSlice`) en el host real.
-- [ ] **Tier 1 — Lectura/mapeo.** Estructura de un componente Codec2 (tomando
+- [x] **Tier 1 — Lectura/mapeo.** Estructura de un componente Codec2 (tomando
       [`android_external_v4l2_codec2`](https://gitcode.com/pi-plus/android_external_v4l2_codec2)
       como referencia de plomería, no de lógica de hardware — eso es V4L2, acá va VA-API).
       Superficie de API de **encode** VA-API (no decode).
