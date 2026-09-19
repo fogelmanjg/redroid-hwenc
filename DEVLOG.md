@@ -119,3 +119,49 @@ generic registrant implementation that just isn't linked in, or whether one need
 **Next step:** find (or write) a working `CodecServiceRegistrant` implementation and confirm the
 software Codec2 path actually lists components end to end — that's the real prerequisite for
 Tier 4, more fundamental than originally scoped.
+
+## 2026-09-19 (same day) — Tier 0 resolved: found and fixed the empty component store
+
+Traced `CodecServiceRegistrant.cpp` against real AOSP source (checked out via a mirror, not
+memory — this stuff is easy to misremember). The "not supported" `listComponents()` belongs to
+`H2C2ComponentStore`, a thin adapter class — and it gets constructed with a **null** backing
+store (`std::make_shared<H2C2ComponentStore>(nullptr)`) specifically when
+`RegisterCodecServicesWithExistingThreadpool()` decides `aidlSelected` is false. When that
+happens, the AIDL binder name `android.hardware.media.c2.IComponentStore/software` still gets
+registered (because the VINTF manifest declares it should exist) — just wired to nothing. That's
+exactly the "process running, service present, zero components" state from the previous entry.
+
+`aidlSelected` comes from `c2_aidl::utils::IsSelected()` → `android::IsCodec2AidlHalSelected()`
+(`frameworks/av/media/codec2/hal/common/HalSelection.cpp`), which requires **both**:
+
+1. Either the `codec_fwk/aidl_hal` aconfig flag is on, **or** `ro.vendor.api_level >= 202404`
+   (a newer, date-based vendor API level scheme — unrelated to `ro.build.version.sdk`).
+2. The property `media.c2.hal.selection` is exactly `"aidl"` (defaults to `"hidl"`).
+
+On this build, `ro.vendor.api_level` is `34` (old-style board API level, nowhere near
+`202404`), and the aconfig flag isn't set — so the very first condition returns `false`
+immediately, and the software store never wires up.
+
+**Fix, confirmed working on a disposable test instance:**
+
+```sh
+device_config put codec_fwk aidl_hal true
+setprop media.c2.hal.selection aidl
+# then restart the service so RegisterCodecServices() re-runs with the new values:
+kill -9 $(ps -A | awk '/media\.swcodec/{print $2}')
+```
+
+After that, `dumpsys android.hardware.media.c2.IComponentStore/software` goes from `NONE` to a
+real dump: **32 registered components**, `android.componentStore.platform`, including
+`c2.android.avc.encoder` and `c2.android.hevc.encoder`.
+
+This isn't the hardware encoder yet — these are still the stock software Codec2 encoders. But
+it's the actual prerequisite Tier 4/5 depend on: there was no working Codec2 *framework* to
+register a hardware component into. There is now. The same `aidl_hal`/`media.c2.hal.selection`
+gate will very likely also apply to whatever store name a future hardware component gets
+registered under (e.g. a `.../vendor` instance) — now we know exactly how to satisfy it instead
+of hitting the same "service present, zero components" dead end again.
+
+**Open question for later:** whether this needs to be set on every boot (boot script /
+`redroid.c2.sh` addition) or can be baked into `media_codecs.xml`/build config permanently.
+Not chased tonight — noting it so it isn't lost.
