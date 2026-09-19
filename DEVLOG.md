@@ -286,3 +286,55 @@ investigated further.
 **Worth carrying back to `redroid-manager`'s Doctor, independent of the NVIDIA question:** missing
 `loop`/`ext4` kernel modules is a real, generic footgun for anyone deploying redroid on a host
 that's never needed them before — cheap, high-value checks to add.
+
+## 2026-09-19 (same day) — NVIDIA options, tried in order: guest mode works, two real sub-bugs found, core issue confirmed
+
+Went through the cheap options before assuming a full vendor HAL rewrite is necessary.
+
+**`gpuMode=guest` (pure software rendering) confirmed working on NVIDIA** — boots clean in ~14s,
+completely sidesteps the gralloc/EGL crash since no GPU driver is involved at all. Not a real fix
+(no hardware acceleration), but a legitimate practical fallback, and useful confirmation that
+everything *else* (loop/ext4/binder/Codec2) is solid on this hardware — the remaining problem is
+narrowly scoped to `gpuMode=host`'s graphics HAL.
+
+**Checked whether NVIDIA's GBM/Vulkan pieces are actually reaching the container** (they need to,
+for any Mesa-side fix to have a chance): confirmed complete. `nvidia-container-toolkit`'s CDI
+spec (`/var/run/cdi/nvidia.yaml`) injects `libnvidia-egl-gbm.so`, `nvidia-drm_gbm.so`, the EGL
+external platform configs, and the Vulkan ICD (`nvidia_icd.json`) into the container. Nothing
+missing here — ruling this out as the cause narrows the problem to an actual negotiation failure,
+not an incomplete environment.
+
+**Tried forcing Zink** (Mesa's OpenGL-over-Vulkan driver, hoping to route around NVIDIA's
+native EGL/GBM path entirely) via `MESA_LOADER_DRIVER_OVERRIDE=zink` / `GALLIUM_DRIVER=zink` env
+vars on the container. Inconclusive as a fix — the crash signature didn't change, and log
+evidence suggests these env vars don't actually get honored by the code path in play here
+(Android's `platform_android` EGL backend, not a normal desktop Mesa app), so this wasn't a real
+test of Zink, just a reminder that the override point needs to be found more precisely if this
+route gets revisited.
+
+**Found and fixed a real, separate bug along the way:** the crash logs (once actually read
+closely, past the vold/blank_screen detour) showed `EGL-MAIN: failed to open
+/dev/dri/renderD128: Permission denied` before the "fallback gralloc" messages. The device node
+`--gpus all` creates inside the container is `crw-rw---- root:992` — and `surfaceflinger` runs as
+Android's `system` AID, which isn't a member of that group inside the container's (Android-only)
+user model. Chmod'ing the device from the *host* has no effect (nvidia-container-toolkit
+recreates the node fresh inside the container, not a true bind-mount of the host's permission
+bits) — fixed it with `docker exec ... chmod 666 /dev/dri/*` from inside the running container
+instead.
+
+**With that permission bug fixed, the actual root cause is confirmed, cleanly, with no more
+noise in the way:** `RenderEngine: no suitable EGLConfig found, giving up`, in
+`SkiaGLRenderEngine::chooseEglConfig`. Device access is no longer the problem — this is a genuine
+EGL config negotiation failure between whatever Mesa's Android-platform fallback gralloc offers
+and what NVIDIA's EGL implementation is willing to hand back. redroid's own vendor gralloc
+(`gralloc.redroid.so`) apparently isn't even the one being used here (Mesa's log explicitly says
+it's using a "fallback gralloc" instead) — so there are really two layered questions now: (1) why
+does `gralloc.redroid.so` decline to handle NVIDIA in the first place, and (2) why does Mesa's
+own fallback then fail to agree on an EGL config with NVIDIA specifically. Neither answered yet.
+
+**Where this leaves it:** the cheap options (1 and 2) are exhausted and didn't produce a fix —
+this really does look like it needs actual HAL-level work (option 3 from the plan), not a
+config/env-var nudge. `gpuMode=guest` stays the practical fallback for NVIDIA hosts in the
+meantime. Given the actual goal of this repo is encode (NVENC, unrelated to this rendering path),
+not full 3D acceleration, this doesn't block Tier 1+ — parking NVIDIA `gpuMode=host` as a
+separate, harder side quest rather than a blocker.
