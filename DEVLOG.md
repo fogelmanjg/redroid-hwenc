@@ -407,3 +407,25 @@ of true zero-copy, but real hardware encode either way. Decided to still treat f
 3D acceleration on NVIDIA as the real goal, not settle for guest-mode-only — without it, most
 APKs (especially games) won't run at acceptable performance. It stays a separate side project,
 doesn't block Tier 1+ on the main roadmap.
+
+**Practical detour, worth documenting even though it doesn't fix anything upstream:** on any
+machine with an NVIDIA discrete GPU *and* a working integrated GPU (iGPU/APU) — Intel CPUs with
+graphics (most of them), AMD Ryzen "G" APUs, and most laptops with hybrid graphics — the iGPU is
+a completely separate DRM device from the dGPU on Linux, nothing fuses them. redroid already has
+a property for pinning the target explicitly:
+
+```
+androidboot.redroid_gpu_node=/dev/dri/renderD128   # whichever node is the iGPU, not NVIDIA
+```
+
+(from `redroid.legacy.rc`: `ro.kernel.redroid.gpu.node` → `ro.boot.redroid_gpu_node`). Skip
+`--gpus all` entirely (that's specifically what injects NVIDIA's libraries) — just
+`--privileged`, then point at the iGPU's render node. This goes through the exact same working
+Mesa/DRI/GBM path already confirmed on Intel (`n02`) — no gralloc/EGL crash, and since that same
+Intel iGPU already showed solid VA-API encode too, you can get *both* accelerated rendering and
+accelerated encode through the iGPU, untouched by any of the NVIDIA-specific problems above.
+Weaker than the discrete GPU for heavy 3D, but real hardware acceleration instead of
+`gpuMode=guest`'s pure software path.
+
+**Doesn't apply to plain AMD Ryzen desktop CPUs without the "G" suffix** (3600, 5600X, 5700X,
+non-G 7000-series, etc.) — those have no integrated graphics at all, nothing to fall back to.
