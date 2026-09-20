@@ -751,3 +751,115 @@ import a dma-buf it never allocated, of the exact kernel object type Android's g
 produces, obtained from a real running Android system process via the correct kernel mechanism —
 is answered **yes**, confirmed against a live object, not just a synthetic stand-in. See
 `tier3-dmabuf-import/README.md` for the consolidated writeup.
+
+## 2026-09-20 (same day) — Tier 4: hardware Codec2 component registers and lists, confirmed on real hardware
+
+Closed Tier 4: got Android to actually recognize and list `c2.hardware.encoder.h264` via
+`dumpsys` on a real, running redroid instance — no real encoding wired in yet (that's Tier 5),
+but the registration/enumeration plumbing works end to end.
+
+**The AOSP source tree was gone.** `~/aosp-redroid-15` (the checkout used to build the
+`redroid-jg-15` images) had been deleted after the last build to free NVMe space — deliberate,
+since it's 130GB+ and there was no known date it'd be needed again. A full backup existed on the
+SATA disk (`aosp-redroid-15.tar`, 134.7GB, plus `aosp-out-redroid15.tar`, 111GB of build
+artifacts/ccache) with sha256 checksums. Verified both, restored both to NVMe (234GB combined,
+294GB free afterward) — the `/out` restore in particular meant the rebuild could be incremental
+rather than from-scratch.
+
+**Found the exact starting point: AOSP ships an official empty-Codec2-service template.**
+`frameworks/av/media/codec2/hal/services/vendor.cpp` is a real, maintained example with a literal
+comment: "make a copy of this whole directory and rename modules accordingly." It has a stub
+`StoreImpl : public C2ComponentStore` returning empty/`C2_NOT_FOUND` from everything, with a
+`// TODO: Replace this with store = new utils::ComponentStore(...)` marking exactly where a real
+implementation plugs in. This is a much better foundation than reference-reading
+`external/v4l2_codec2` from scratch (Tier 1) — it's the same shape, official, and already wired
+into the AIDL registration path this specific build needs (confirmed via checking the live
+instance: only `IComponentStore/software` is registered, `vaapi` was free to use).
+
+**New module: `external/vaapi_codec2/service/`.** Copied the template, made two changes:
+stripped the HIDL half entirely (Tier 0 already confirmed this build only activates a Codec2
+store when `media.c2.hal.selection=aidl`, so the generic template's dual HIDL/AIDL branching is
+dead weight here), and made `listComponents()` return one `C2Component::Traits` entry
+(`c2.hardware.encoder.h264`, `DOMAIN_VIDEO`, `KIND_ENCODER`, `rank=1`, `video/avc`) instead of an
+empty list. `createComponent()`/`createInterface()` still return `C2_NOT_FOUND` — Tier 4's whole
+point is enumeration, not a working encoder. Wired into the build via
+`hardware/redroid/c2/c2.mk` (the same file that already carried the `redroid.c2.rc`/`.sh` hooks
+found in Tier 0), `PRODUCT_PACKAGES += android.hardware.media.c2-vaapi-service`.
+
+**First build attempt taught a real lesson about the build container.** `redroid-rebuild`'s
+entrypoint is `chroot ... /bin/bash -i` — an interactive shell with no real tty attached. It
+eventually exited (nothing was feeding it stdin), and Docker tore down every process in that
+container's namespace when its PID 1 died — including a `soong_build`/ninja run that was still
+genuinely working (not hung), killing ~10 minutes of the first-ever Soong analysis pass on the
+restored `/out`. Fixed by replacing it with a new container (`redroid-build-persist`) using
+`--entrypoint /bin/sleep infinity` as PID 1 instead, running actual build commands via
+`docker exec --user jgustavo` — durable regardless of how long any single command takes, no
+dependency on an interactive shell surviving.
+
+**The targeted module build worked on the first real try afterward**: `m android.hardware.media.c2-vaapi-service`
+compiled clean, 293 targets, ~9.5 minutes, zero errors — installed the binary, its `.rc`, the
+seccomp policy, and (confirming Tier 1's exact prediction) the VINTF manifest fragment at
+`vendor/etc/vintf/manifest/manifest_media_c2_vaapi.xml`. `m vendorimage` afterward repackaged
+`vendor.img` in 20 seconds (all the real compilation was already done and cached).
+
+**Deploying into a live container without a full image re-import.** These redroid Docker images
+are a flattened rootfs (`docker import` of combined system+vendor content), not a mounted `.img`
+file redroid reads at runtime — so getting the new component into a real container meant mounting
+the freshly-built `vendor.img` (plain ext4, `mount -o loop`) and `docker cp`-ing the relevant
+files directly into a redroid container's `/vendor`, matching the wifi-v2/v3 image history's own
+apparent pattern of incremental runtime patches rather than full rebuilds each time.
+
+**Two more real bugs surfaced and fixed getting a clean boot:**
+1. Files must be injected while the container is *created but not yet started* — Android's init
+   only parses `/vendor/etc/init/*.rc` once, early in boot. Copying into an already-booted
+   container is too late; it won't pick up the new service without a full restart of the
+   container (which reintroduces problem #2 below).
+2. `docker stop` + `docker start` on the *same* container changes its veth's MAC address, but the
+   bridge's FDB can be left with stale "permanent" entries pointing at the old MAC — ARP for the
+   container's IP then fails outright (`No route to host` / neighbor state `FAILED`/`INCOMPLETE`),
+   even though `docker exec` (which doesn't go through the network stack) shows the container is
+   completely healthy inside. This is the *same* bug class as the very first manual test-instance
+   attempt earlier today, now confirmed to trigger on stop/start of a single container too, not
+   just on first creation. Workaround used both times: never stop/start the same container: 
+   `docker rm` + fresh `docker create` (inject files) + `docker start`, and use a brand-new
+   dedicated Docker network each time rather than reusing one that's already had containers churn
+   through it. A real docker0-adjacent host issue worth investigating properly at some point, not
+   yet root-caused.
+3. First successful boot crash-looped anyway: `CANNOT LINK EXECUTABLE
+   ".../android.hardware.media.c2-vaapi-service": library "libcodec2.so" not found`. Only copied
+   the 4 files directly tied to our module at first, forgetting that adding this module pulled 16
+   *new* shared libraries into `vendor.img` that weren't in the stock wifi-v3 image before
+   (`libcodec2.so`, `libcodec2_aidl.so`, `libcodec2_vndk.so`, the AIDL bufferpool/bufferqueue libs,
+   `libavservices_minijail.so`, `libminijail.so`, `libcap.so`, `libdmabufheap.so`, `libion.so`,
+   etc.) — diffed the mounted `vendor.img`'s `/lib64` against the running container's to find
+   exactly which 16 were missing, copied those in too.
+
+**Confirmed working, on a real running container**: `service list` shows
+`android.hardware.media.c2.IComponentStore/vaapi` registered alongside the stock `/software`
+store, and `dumpsys android.hardware.media.c2.IComponentStore/vaapi` reports exactly the intended
+result:
+
+```
+Supported components:
+    name: c2.hardware.encoder.h264
+    domain: 1        # DOMAIN_VIDEO
+    kind: 2          # KIND_ENCODER
+    rank: 1
+    mediaType: video/avc
+
+Active components:
+    NONE
+```
+
+"Active: NONE" is expected and correct — recognized and listed, nothing instantiable yet.
+
+**What Tier 5 needs, and what carries over:** the test container (`jg-redroid-tier4-test`, on its
+own dedicated Docker network, `--restart no`) is left running as a testbed. Iterating on
+`createComponent()`'s real implementation doesn't need a fresh container each time — rebuilding
+just this module and replacing the binary, then restarting only the Android-level service (not
+the Docker container), avoids the stop/start networking bug entirely since it never touches the
+container's network namespace. The one thing that *will* require repeating today's
+build-vendor.img-and-inject-new-libs dance is any genuinely new shared-library dependency Tier 5
+pulls in — most notably `libva`/Mesa's VA-API Gallium state tracker itself, confirmed back in
+Tier 0 to be completely absent from this vendor image today. That's real, known work ahead, not a
+surprise.

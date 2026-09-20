@@ -1,0 +1,62 @@
+// Codec2 IComponentStore service for redroid-hwenc's VA-API hardware
+// encoder (Tier 4: registration/enumeration only, no encode wired in yet).
+// Adapted from AOSP's example empty service at
+// frameworks/av/media/codec2/hal/services/Android.bp.
+
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+cc_binary {
+    name: "android.hardware.media.c2-vaapi-service",
+    vendor: true,
+    relative_install_path: "hw",
+
+    init_rc: ["android.hardware.media.c2-vaapi-service.rc"],
+
+    // AIDL-only -- this build only wires up Codec2 stores registered via
+    // AIDL (see Tier 0's aidl_hal/media.c2.hal.selection finding), so the
+    // HIDL half of the generic template's defaults isn't needed here.
+    defaults: [
+        "libcodec2-aidl-defaults",
+    ],
+
+    srcs: [
+        "service.cpp",
+    ],
+
+    shared_libs: [
+        "libavservices_minijail",
+        "libbinder",
+        "libbinder_ndk",
+    ],
+    required: ["android.hardware.media.c2-vaapi-seccomp_policy"],
+
+    vintf_fragments: ["manifest_media_c2_vaapi.xml"],
+}
+
+prebuilt_etc {
+    name: "android.hardware.media.c2-vaapi-seccomp_policy",
+    vendor: true,
+    sub_dir: "seccomp_policy",
+
+    arch: {
+        arm: {
+            src: "seccomp_policy/android.hardware.media.c2-default-arm.policy",
+        },
+        arm64: {
+            src: "seccomp_policy/android.hardware.media.c2-default-arm64.policy",
+        },
+        riscv64: {
+            src: "seccomp_policy/android.hardware.media.c2-default-riscv64.policy",
+        },
+        x86: {
+            src: "seccomp_policy/android.hardware.media.c2-default-x86.policy",
+        },
+        x86_64: {
+            src: "seccomp_policy/android.hardware.media.c2-default-x86_64.policy",
+        },
+    },
+
+    required: ["crash_dump.policy"],
+}

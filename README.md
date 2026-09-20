@@ -63,8 +63,16 @@ Each tier assumes the previous one is done. ⭐ marks the highest-leverage check
       [tier3-dmabuf-import/README.md](tier3-dmabuf-import/README.md) for the full writeup,
       including the one open nuance (confirming the specific buffer instance held live frame
       content, not just that the import mechanism itself works).
-- [ ] **Tier 4 — Codec2 skeleton in Android.** A component that Android recognizes and lists
+- [x] **Tier 4 — Codec2 skeleton in Android.** A component that Android recognizes and lists
       (`dumpsys media.c2`) as `c2.hardware.encoder.h264`, without real encoding wired in yet.
+      **Confirmed on a real running instance**: `service list` shows
+      `android.hardware.media.c2.IComponentStore/vaapi` registered, and `dumpsys` on it reports
+      `c2.hardware.encoder.h264` (domain video, kind encoder) with `Active components: NONE` —
+      recognized and listed, nothing instantiable yet, exactly as scoped. Built from AOSP's own
+      official empty-Codec2-service template (`frameworks/av/media/codec2/hal/services/`), not
+      from scratch. See `DEVLOG.md` for the full build/deploy story, including three real bugs
+      found and fixed along the way (a build-container lifecycle bug, a docker0 bridge networking
+      bug, and a missing-shared-library crash loop).
 - [ ] **Tier 5 — Real integration.** Tier 3 + Tier 2 wired into the callbacks of the Tier 4
       component. The actual goal.
 - [ ] **Tier 6 (conditional on Tier 0).** If redroid/scrcpy's codec selection turns out to be
@@ -75,14 +83,17 @@ has been documented by anyone until now.
 
 ## Current status
 
-Tiers 0-3 done. Codec2 hardware-encode gap root-caused and fixed across AMD/Intel/NVIDIA; a
+Tiers 0-4 done. Codec2 hardware-encode gap root-caused and fixed across AMD/Intel/NVIDIA; a
 standalone VA-API H.264 encoder proven working end to end on real hardware (verified decodable
-output, not just successful API calls); and the Tier 3 make-or-break question — whether a dma-buf
+output, not just successful API calls); the Tier 3 make-or-break question — whether a dma-buf
 VA-API didn't allocate can be imported and correctly encoded from — confirmed across three real
 GPUs (AMD APU, AMD discrete, Intel iGPU) with a synthetic buffer, then confirmed again against a
-real, live dma-buf pulled out of a running redroid container's own gralloc-backed process. Next up:
-Tier 4 (the Codec2 component skeleton). See [DEVLOG.md](DEVLOG.md) for the real progress, session
-by session.
+real, live dma-buf pulled out of a running redroid container's own gralloc-backed process; and a
+real Codec2 hardware component (`c2.hardware.encoder.h264`) now registers and lists correctly on
+a live redroid instance. Next up: Tier 5 — wiring Tier 2/3's actual VA-API encode logic into the
+Tier 4 component's callbacks, which will also need `libva`/Mesa's VA-API Gallium state tracker
+bundled into the vendor image for the first time (confirmed absent since Tier 0). See
+[DEVLOG.md](DEVLOG.md) for the real progress, session by session.
 
 ## Contributing
 
