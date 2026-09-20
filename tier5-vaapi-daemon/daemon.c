@@ -1,0 +1,538 @@
+/*
+ * Tier 5.2: VA-API encode daemon.
+ *
+ * A persistent host-side (glibc) process that does real hardware H.264
+ * encode on behalf of the Codec2 component that will eventually run inside
+ * Android (bionic) -- see protocol.h for why this exists instead of a
+ * native Android-side VA-API stack.
+ *
+ * The actual encode logic (packed SPS/PPS/slice headers, the VA-API call
+ * sequence, the dma-buf import via VASurfaceAttribExternalBuffers) is the
+ * same pipeline already proven end to end in tier2-vaapi-encode and
+ * tier3-dmabuf-import -- this just wraps it in a socket server instead of
+ * a one-shot CLI tool, and imports whatever dma-buf a client hands it
+ * instead of allocating/filling one itself.
+ */
+
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+
+#include <va/va.h>
+#include <va/va_drm.h>
+#include <va/va_drmcommon.h>
+#include <va/va_enc_h264.h>
+
+#include "protocol.h"
+
+#define DRM_RENDER_DEVICE "/dev/dri/renderD128"
+
+#define CHECK_VA(status, msg)                                                \
+    do {                                                                     \
+        if ((status) != VA_STATUS_SUCCESS) {                                 \
+            fprintf(stderr, "%s failed: %s (0x%x)\n", (msg),                 \
+                    vaErrorStr(status), (status));                           \
+            return -1;                                                      \
+        }                                                                    \
+    } while (0)
+
+static unsigned int align16(unsigned int v) { return (v + 15) & ~15u; }
+
+/* ------------------------------------------------------------------ *
+ * Same bitstream writer as tier2-vaapi-encode/main.c -- see that file
+ * for the detailed spec-reference comments on each field. Kept terse
+ * here since this daemon's own comments focus on what's new (the socket
+ * protocol and per-request dma-buf import), not re-deriving H.264 syntax.
+ * ------------------------------------------------------------------ */
+typedef struct {
+    unsigned char *buf;
+    size_t capacity;
+    size_t bit_pos;
+} bitstream_t;
+
+static void bs_init(bitstream_t *bs) {
+    bs->capacity = 256;
+    bs->buf = calloc(1, bs->capacity);
+    bs->bit_pos = 0;
+}
+
+static void bs_grow_if_needed(bitstream_t *bs, size_t extra_bits) {
+    size_t needed_bytes = (bs->bit_pos + extra_bits + 7) / 8;
+    if (needed_bytes <= bs->capacity) return;
+    while (needed_bytes > bs->capacity) bs->capacity *= 2;
+    bs->buf = realloc(bs->buf, bs->capacity);
+}
+
+static void bs_put_bit(bitstream_t *bs, unsigned int bit) {
+    bs_grow_if_needed(bs, 1);
+    size_t byte_i = bs->bit_pos / 8;
+    int shift = 7 - (bs->bit_pos % 8);
+    if (bit) bs->buf[byte_i] |= (1u << shift);
+    bs->bit_pos++;
+}
+
+static void bs_put_bits(bitstream_t *bs, unsigned int value, int n) {
+    for (int i = n - 1; i >= 0; i--) bs_put_bit(bs, (value >> i) & 1);
+}
+
+static void bs_put_ue(bitstream_t *bs, unsigned int val) {
+    unsigned int code_num = val + 1;
+    int bits = 0;
+    for (unsigned int tmp = code_num; tmp; tmp >>= 1) bits++;
+    bs_put_bits(bs, 0, bits - 1);
+    bs_put_bits(bs, code_num, bits);
+}
+
+static void bs_put_se(bitstream_t *bs, int val) {
+    unsigned int mapped = (val <= 0) ? (unsigned int)(-2 * val)
+                                      : (unsigned int)(2 * val - 1);
+    bs_put_ue(bs, mapped);
+}
+
+static void bs_rbsp_trailing_bits(bitstream_t *bs) {
+    bs_put_bit(bs, 1);
+    while (bs->bit_pos % 8) bs_put_bit(bs, 0);
+}
+
+static void bs_start_code_and_nal_header(bitstream_t *bs, int nal_ref_idc, int nal_unit_type) {
+    bs_put_bits(bs, 0x000001, 24);
+    bs_put_bit(bs, 0);
+    bs_put_bits(bs, nal_ref_idc, 2);
+    bs_put_bits(bs, nal_unit_type, 5);
+}
+
+static void build_sps_rbsp(bitstream_t *bs, const VAEncSequenceParameterBufferH264 *seq) {
+    bs_start_code_and_nal_header(bs, 3, 7);
+    bs_put_bits(bs, 66, 8);
+    bs_put_bit(bs, 1);
+    bs_put_bit(bs, 1);
+    bs_put_bit(bs, 0);
+    bs_put_bit(bs, 0);
+    bs_put_bits(bs, 0, 4);
+    bs_put_bits(bs, seq->level_idc, 8);
+    bs_put_ue(bs, seq->seq_parameter_set_id);
+    bs_put_ue(bs, seq->seq_fields.bits.log2_max_frame_num_minus4);
+    bs_put_ue(bs, seq->seq_fields.bits.pic_order_cnt_type);
+    bs_put_ue(bs, seq->max_num_ref_frames);
+    bs_put_bit(bs, 0);
+    bs_put_ue(bs, seq->picture_width_in_mbs - 1);
+    bs_put_ue(bs, seq->picture_height_in_mbs - 1);
+    bs_put_bit(bs, seq->seq_fields.bits.frame_mbs_only_flag);
+    bs_put_bit(bs, 1);
+    bs_put_bit(bs, seq->frame_cropping_flag);
+    if (seq->frame_cropping_flag) {
+        bs_put_ue(bs, seq->frame_crop_left_offset);
+        bs_put_ue(bs, seq->frame_crop_right_offset);
+        bs_put_ue(bs, seq->frame_crop_top_offset);
+        bs_put_ue(bs, seq->frame_crop_bottom_offset);
+    }
+    bs_put_bit(bs, 0);
+    bs_rbsp_trailing_bits(bs);
+}
+
+static void build_pps_rbsp(bitstream_t *bs, const VAEncPictureParameterBufferH264 *pic) {
+    bs_start_code_and_nal_header(bs, 3, 8);
+    bs_put_ue(bs, pic->pic_parameter_set_id);
+    bs_put_ue(bs, pic->seq_parameter_set_id);
+    bs_put_bit(bs, pic->pic_fields.bits.entropy_coding_mode_flag);
+    bs_put_bit(bs, 0);
+    bs_put_ue(bs, 0);
+    bs_put_ue(bs, pic->num_ref_idx_l0_active_minus1);
+    bs_put_ue(bs, 0);
+    bs_put_bit(bs, 0);
+    bs_put_bits(bs, 0, 2);
+    bs_put_se(bs, pic->pic_init_qp - 26);
+    bs_put_se(bs, 0);
+    bs_put_se(bs, 0);
+    bs_put_bit(bs, pic->pic_fields.bits.deblocking_filter_control_present_flag);
+    bs_put_bit(bs, 0);
+    bs_put_bit(bs, 0);
+    bs_rbsp_trailing_bits(bs);
+}
+
+static void build_slice_header_bits(bitstream_t *bs,
+                                     const VAEncSequenceParameterBufferH264 *seq,
+                                     const VAEncPictureParameterBufferH264 *pic,
+                                     const VAEncSliceParameterBufferH264 *slice) {
+    bs_start_code_and_nal_header(bs, 3, 5);
+    bs_put_ue(bs, slice->macroblock_address);
+    bs_put_ue(bs, slice->slice_type);
+    bs_put_ue(bs, slice->pic_parameter_set_id);
+    bs_put_bits(bs, pic->frame_num,
+                seq->seq_fields.bits.log2_max_frame_num_minus4 + 4);
+    bs_put_ue(bs, slice->idr_pic_id);
+    bs_put_bit(bs, 0);
+    bs_put_bit(bs, 0);
+    bs_put_se(bs, slice->slice_qp_delta);
+    if (pic->pic_fields.bits.deblocking_filter_control_present_flag) {
+        bs_put_ue(bs, slice->disable_deblocking_filter_idc);
+        if (slice->disable_deblocking_filter_idc != 1) {
+            bs_put_se(bs, 0);
+            bs_put_se(bs, 0);
+        }
+    }
+}
+
+static void submit_packed_header(VADisplay dpy, VAContextID context_id,
+                                  VAEncPackedHeaderType type, bitstream_t *bs,
+                                  VABufferID *out_param_buf, VABufferID *out_data_buf) {
+    VAEncPackedHeaderParameterBuffer param = {0};
+    param.type = type;
+    param.bit_length = (unsigned int)bs->bit_pos;
+    param.has_emulation_bytes = 0;
+    vaCreateBuffer(dpy, context_id, VAEncPackedHeaderParameterBufferType,
+                   sizeof(param), 1, &param, out_param_buf);
+    vaCreateBuffer(dpy, context_id, VAEncPackedHeaderDataBufferType,
+                   (bs->bit_pos + 7) / 8, 1, bs->buf, out_data_buf);
+}
+
+/* ------------------------------------------------------------------ *
+ * Persistent VA-API state, initialized once at daemon startup and reused
+ * across requests. Config/context are sized to a specific resolution;
+ * encode_one_frame() recreates them if a request's resolution changes.
+ * ------------------------------------------------------------------ */
+typedef struct {
+    int drm_fd;
+    VADisplay dpy;
+    VAEntrypoint entrypoint;
+    VAConfigID config_id;
+    VAContextID context_id;
+    VASurfaceID surfaces[2]; /* [0] = imported input (recreated per request), [1] = recon */
+    unsigned int width, height;
+    int have_context;
+} vaapi_state_t;
+
+static int vaapi_state_init(vaapi_state_t *st) {
+    memset(st, 0, sizeof(*st));
+    st->drm_fd = open(DRM_RENDER_DEVICE, O_RDWR);
+    if (st->drm_fd < 0) {
+        perror("open " DRM_RENDER_DEVICE);
+        return -1;
+    }
+    st->dpy = vaGetDisplayDRM(st->drm_fd);
+    if (!st->dpy) {
+        fprintf(stderr, "vaGetDisplayDRM failed\n");
+        return -1;
+    }
+    int major, minor;
+    CHECK_VA(vaInitialize(st->dpy, &major, &minor), "vaInitialize");
+    fprintf(stderr, "VA-API %d.%d, driver: %s\n", major, minor,
+            vaQueryVendorString(st->dpy));
+
+    int num_entrypoints = vaMaxNumEntrypoints(st->dpy);
+    VAEntrypoint *entrypoints = malloc(num_entrypoints * sizeof(VAEntrypoint));
+    int n = 0;
+    CHECK_VA(vaQueryConfigEntrypoints(st->dpy, VAProfileH264ConstrainedBaseline,
+                                       entrypoints, &n),
+             "vaQueryConfigEntrypoints");
+    st->entrypoint = (VAEntrypoint)-1;
+    for (int i = 0; i < n; i++) {
+        if (entrypoints[i] == VAEntrypointEncSlice || entrypoints[i] == VAEntrypointEncSliceLP) {
+            st->entrypoint = entrypoints[i];
+            break;
+        }
+    }
+    free(entrypoints);
+    if (st->entrypoint == (VAEntrypoint)-1) {
+        fprintf(stderr, "No H.264 encode entrypoint on this GPU\n");
+        return -1;
+    }
+    fprintf(stderr, "Using entrypoint %s\n",
+            st->entrypoint == VAEntrypointEncSlice ? "VAEntrypointEncSlice" : "VAEntrypointEncSliceLP");
+
+    VAConfigAttrib attrib = {.type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420};
+    CHECK_VA(vaCreateConfig(st->dpy, VAProfileH264ConstrainedBaseline, st->entrypoint,
+                             &attrib, 1, &st->config_id),
+             "vaCreateConfig");
+    st->have_context = 0;
+    return 0;
+}
+
+/* (Re)creates the context + recon surface for a new resolution. The
+ * imported input surface (surfaces[0]) is created fresh per request
+ * regardless, since it wraps a different dma-buf every time. */
+static int vaapi_state_ensure_resolution(vaapi_state_t *st, unsigned int width, unsigned int height) {
+    if (st->have_context && st->width == width && st->height == height) return 0;
+    if (st->have_context) {
+        vaDestroyContext(st->dpy, st->context_id);
+        vaDestroySurfaces(st->dpy, &st->surfaces[1], 1);
+        st->have_context = 0;
+    }
+    CHECK_VA(vaCreateSurfaces(st->dpy, VA_RT_FORMAT_YUV420, width, height,
+                               &st->surfaces[1], 1, NULL, 0),
+             "vaCreateSurfaces(recon)");
+    CHECK_VA(vaCreateContext(st->dpy, st->config_id, width, height, VA_PROGRESSIVE,
+                              &st->surfaces[1], 1, &st->context_id),
+             "vaCreateContext");
+    st->width = width;
+    st->height = height;
+    st->have_context = 1;
+    return 0;
+}
+
+/* Imports the client's dma-buf as surfaces[0], runs the same encode
+ * sequence tier2/tier3 already proved, and returns malloc'd Annex-B H.264
+ * bytes (caller frees). Returns byte count, or -1 on error. */
+static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeRequest *req,
+                              unsigned char **out_buf) {
+    if (vaapi_state_ensure_resolution(st, req->width, req->height) != 0) return -1;
+
+    uintptr_t buffer_handles[1] = {(uintptr_t)dmabuf_fd};
+    VASurfaceAttribExternalBuffers ext_buf = {0};
+    ext_buf.pixel_format = VA_FOURCC_NV12;
+    ext_buf.width = req->width;
+    ext_buf.height = req->height;
+    ext_buf.data_size = req->dmabuf_size;
+    ext_buf.num_planes = 2;
+    ext_buf.pitches[0] = req->stride_y;
+    ext_buf.pitches[1] = req->stride_uv;
+    ext_buf.offsets[0] = 0;
+    ext_buf.offsets[1] = req->offset_uv;
+    ext_buf.buffers = buffer_handles;
+    ext_buf.num_buffers = 1;
+
+    VASurfaceAttrib import_attribs[2];
+    import_attribs[0].type = VASurfaceAttribMemoryType;
+    import_attribs[0].flags = VA_SURFACE_ATTRIB_SETTABLE;
+    import_attribs[0].value.type = VAGenericValueTypeInteger;
+    import_attribs[0].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME;
+    import_attribs[1].type = VASurfaceAttribExternalBufferDescriptor;
+    import_attribs[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
+    import_attribs[1].value.type = VAGenericValueTypePointer;
+    import_attribs[1].value.value.p = &ext_buf;
+
+    VAStatus st_import = vaCreateSurfaces(st->dpy, VA_RT_FORMAT_YUV420, req->width, req->height,
+                                           &st->surfaces[0], 1, import_attribs, 2);
+    if (st_import != VA_STATUS_SUCCESS) {
+        fprintf(stderr, "dma-buf import failed: %s\n", vaErrorStr(st_import));
+        return -1;
+    }
+
+    unsigned int mb_width = align16(req->width) / 16;
+    unsigned int mb_height = align16(req->height) / 16;
+
+    VABufferID coded_buf;
+    CHECK_VA(vaCreateBuffer(st->dpy, st->context_id, VAEncCodedBufferType,
+                             req->width * req->height * 3, 1, NULL, &coded_buf),
+             "vaCreateBuffer(coded)");
+
+    VAEncSequenceParameterBufferH264 seq = {0};
+    seq.seq_parameter_set_id = 0;
+    seq.level_idc = 30;
+    seq.intra_period = 1;
+    seq.intra_idr_period = 1;
+    seq.ip_period = 0;
+    seq.bits_per_second = 2000000;
+    seq.max_num_ref_frames = 1;
+    seq.picture_width_in_mbs = mb_width;
+    seq.picture_height_in_mbs = mb_height;
+    seq.seq_fields.bits.frame_mbs_only_flag = 1;
+    seq.seq_fields.bits.chroma_format_idc = 1;
+    seq.seq_fields.bits.log2_max_frame_num_minus4 = 0;
+    seq.seq_fields.bits.pic_order_cnt_type = 2;
+    seq.frame_cropping_flag = (req->width != mb_width * 16 || req->height != mb_height * 16);
+    seq.frame_crop_right_offset = (mb_width * 16 - req->width) / 2;
+    seq.frame_crop_bottom_offset = (mb_height * 16 - req->height) / 2;
+
+    VABufferID seq_buf;
+    vaCreateBuffer(st->dpy, st->context_id, VAEncSequenceParameterBufferType, sizeof(seq), 1, &seq, &seq_buf);
+
+    VAEncPictureParameterBufferH264 pic = {0};
+    pic.CurrPic.picture_id = st->surfaces[1];
+    for (int i = 0; i < 16; i++) {
+        pic.ReferenceFrames[i].picture_id = VA_INVALID_ID;
+        pic.ReferenceFrames[i].flags = VA_PICTURE_H264_INVALID;
+    }
+    pic.coded_buf = coded_buf;
+    pic.pic_init_qp = 26;
+    pic.pic_fields.bits.idr_pic_flag = 1;
+    pic.pic_fields.bits.reference_pic_flag = 1;
+    pic.pic_fields.bits.entropy_coding_mode_flag = 1;
+    pic.pic_fields.bits.deblocking_filter_control_present_flag = 1;
+
+    VABufferID pic_buf;
+    vaCreateBuffer(st->dpy, st->context_id, VAEncPictureParameterBufferType, sizeof(pic), 1, &pic, &pic_buf);
+
+    VAEncSliceParameterBufferH264 slice = {0};
+    slice.num_macroblocks = mb_width * mb_height;
+    slice.macroblock_info = VA_INVALID_ID;
+    slice.slice_type = 2;
+    slice.direct_spatial_mv_pred_flag = 1;
+    slice.num_ref_idx_active_override_flag = 1;
+    for (int i = 0; i < 32; i++) {
+        slice.RefPicList0[i].picture_id = VA_INVALID_ID;
+        slice.RefPicList0[i].flags = VA_PICTURE_H264_INVALID;
+        slice.RefPicList1[i].picture_id = VA_INVALID_ID;
+        slice.RefPicList1[i].flags = VA_PICTURE_H264_INVALID;
+    }
+
+    VABufferID slice_buf;
+    vaCreateBuffer(st->dpy, st->context_id, VAEncSliceParameterBufferType, sizeof(slice), 1, &slice, &slice_buf);
+
+    bitstream_t sps_bs, pps_bs, slice_hdr_bs;
+    bs_init(&sps_bs);
+    bs_init(&pps_bs);
+    bs_init(&slice_hdr_bs);
+    build_sps_rbsp(&sps_bs, &seq);
+    build_pps_rbsp(&pps_bs, &pic);
+    build_slice_header_bits(&slice_hdr_bs, &seq, &pic, &slice);
+
+    VABufferID sps_param_buf, sps_data_buf, pps_param_buf, pps_data_buf;
+    VABufferID slice_hdr_param_buf, slice_hdr_data_buf;
+    submit_packed_header(st->dpy, st->context_id, VAEncPackedHeaderSequence, &sps_bs, &sps_param_buf, &sps_data_buf);
+    submit_packed_header(st->dpy, st->context_id, VAEncPackedHeaderPicture, &pps_bs, &pps_param_buf, &pps_data_buf);
+    submit_packed_header(st->dpy, st->context_id, VAEncPackedHeaderSlice, &slice_hdr_bs, &slice_hdr_param_buf, &slice_hdr_data_buf);
+
+    CHECK_VA(vaBeginPicture(st->dpy, st->context_id, st->surfaces[0]), "vaBeginPicture");
+    VABufferID b1[] = {seq_buf};
+    vaRenderPicture(st->dpy, st->context_id, b1, 1);
+    VABufferID b2[] = {sps_param_buf, sps_data_buf};
+    vaRenderPicture(st->dpy, st->context_id, b2, 2);
+    VABufferID b3[] = {pic_buf};
+    vaRenderPicture(st->dpy, st->context_id, b3, 1);
+    VABufferID b4[] = {pps_param_buf, pps_data_buf};
+    vaRenderPicture(st->dpy, st->context_id, b4, 2);
+    VABufferID b5[] = {slice_hdr_param_buf, slice_hdr_data_buf};
+    vaRenderPicture(st->dpy, st->context_id, b5, 2);
+    VABufferID b6[] = {slice_buf};
+    vaRenderPicture(st->dpy, st->context_id, b6, 1);
+    CHECK_VA(vaEndPicture(st->dpy, st->context_id), "vaEndPicture");
+    CHECK_VA(vaSyncSurface(st->dpy, st->surfaces[0]), "vaSyncSurface");
+
+    free(sps_bs.buf);
+    free(pps_bs.buf);
+    free(slice_hdr_bs.buf);
+
+    VACodedBufferSegment *seg = NULL;
+    CHECK_VA(vaMapBuffer(st->dpy, coded_buf, (void **)&seg), "vaMapBuffer(coded)");
+    size_t total = 0;
+    for (VACodedBufferSegment *s = seg; s != NULL; s = s->next) total += s->size;
+    unsigned char *out = malloc(total);
+    size_t off = 0;
+    for (VACodedBufferSegment *s = seg; s != NULL; s = s->next) {
+        memcpy(out + off, s->buf, s->size);
+        off += s->size;
+    }
+    vaUnmapBuffer(st->dpy, coded_buf);
+    vaDestroyBuffer(st->dpy, coded_buf);
+    vaDestroySurfaces(st->dpy, &st->surfaces[0], 1);
+
+    *out_buf = out;
+    return (long)total;
+}
+
+/* ------------------------------------------------------------------ *
+ * Socket server: one connection = one request/response, per protocol.h.
+ * ------------------------------------------------------------------ */
+static int recv_request(int conn_fd, EncodeRequest *req, int *out_dmabuf_fd) {
+    char cmsg_buf[CMSG_SPACE(sizeof(int))];
+    struct iovec iov = {.iov_base = req, .iov_len = sizeof(*req)};
+    struct msghdr msg = {0};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf;
+    msg.msg_controllen = sizeof(cmsg_buf);
+
+    ssize_t n = recvmsg(conn_fd, &msg, 0);
+    if (n != (ssize_t)sizeof(*req)) {
+        if (n < 0) perror("recvmsg");
+        else fprintf(stderr, "recvmsg: short read (%zd of %zu bytes)\n", n, sizeof(*req));
+        return -1;
+    }
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (!cmsg || cmsg->cmsg_type != SCM_RIGHTS) {
+        fprintf(stderr, "recvmsg: no fd received (SCM_RIGHTS missing)\n");
+        return -1;
+    }
+    memcpy(out_dmabuf_fd, CMSG_DATA(cmsg), sizeof(int));
+    return 0;
+}
+
+static void send_response(int conn_fd, int32_t status, const unsigned char *buf, uint32_t size) {
+    EncodeResponse resp = {.status = status, .coded_size = (status == 0) ? size : 0};
+    if (write(conn_fd, &resp, sizeof(resp)) != (ssize_t)sizeof(resp)) {
+        perror("write(response header)");
+        return;
+    }
+    if (status == 0 && size > 0) {
+        if (write(conn_fd, buf, size) != (ssize_t)size) perror("write(response body)");
+    }
+}
+
+static void handle_connection(vaapi_state_t *st, int conn_fd) {
+    EncodeRequest req;
+    int dmabuf_fd = -1;
+    if (recv_request(conn_fd, &req, &dmabuf_fd) != 0) {
+        send_response(conn_fd, -1, NULL, 0);
+        return;
+    }
+
+    fprintf(stderr, "Request: %ux%u, stride_y=%u stride_uv=%u offset_uv=%u dmabuf_size=%u fd=%d\n",
+            req.width, req.height, req.stride_y, req.stride_uv, req.offset_uv, req.dmabuf_size, dmabuf_fd);
+
+    unsigned char *out_buf = NULL;
+    long n = encode_one_frame(st, dmabuf_fd, &req, &out_buf);
+    close(dmabuf_fd);
+
+    if (n < 0) {
+        send_response(conn_fd, -1, NULL, 0);
+    } else {
+        fprintf(stderr, "Encoded %ld bytes\n", n);
+        send_response(conn_fd, 0, out_buf, (uint32_t)n);
+        free(out_buf);
+    }
+}
+
+int main(void) {
+    setvbuf(stderr, NULL, _IONBF, 0);
+
+    vaapi_state_t st;
+    if (vaapi_state_init(&st) != 0) return 1;
+
+    /* Parent directory is the shared bind-mount point between this host
+     * process and the redroid container (see README.md) -- created here
+     * so the daemon can run before that mount is even set up manually. */
+    mkdir("/dev/vaapi-helper", 0755);
+    unlink(VAAPI_DAEMON_SOCKET_PATH);
+
+    int listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        perror("socket");
+        return 1;
+    }
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, VAAPI_DAEMON_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        perror("bind");
+        return 1;
+    }
+    chmod(VAAPI_DAEMON_SOCKET_PATH, 0666);
+    if (listen(listen_fd, 4) != 0) {
+        perror("listen");
+        return 1;
+    }
+    fprintf(stderr, "Listening on %s\n", VAAPI_DAEMON_SOCKET_PATH);
+
+    while (1) {
+        int conn_fd = accept(listen_fd, NULL, NULL);
+        if (conn_fd < 0) {
+            if (errno == EINTR) continue;
+            perror("accept");
+            break;
+        }
+        handle_connection(&st, conn_fd);
+        close(conn_fd);
+    }
+
+    close(listen_fd);
+    return 0;
+}

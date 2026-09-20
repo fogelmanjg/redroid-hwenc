@@ -74,7 +74,13 @@ Each tier assumes the previous one is done. ⭐ marks the highest-leverage check
       found and fixed along the way (a build-container lifecycle bug, a docker0 bridge networking
       bug, and a missing-shared-library crash loop).
 - [ ] **Tier 5 — Real integration.** Tier 3 + Tier 2 wired into the callbacks of the Tier 4
-      component. The actual goal.
+      component. The actual goal. **Architecture pivot**: porting Mesa's VA-API driver stack to
+      build against Android's bionic turned out to need a full `radeonsi` + winsys + LLVM port
+      (this build's Mesa only compiles the `gfxstream`/ANGLE/Vulkan forwarding-to-host pieces for
+      Android, no native GPU driver at all) — realistically weeks of work on its own. Pivoted
+      instead to a host-side encode daemon the Android component talks to over a Unix socket,
+      reusing Tier 2/3's pipeline unchanged. Sub-goal 5.2 (the daemon itself) is done — see
+      [tier5-vaapi-daemon/README.md](tier5-vaapi-daemon/README.md).
 - [ ] **Tier 6 (conditional on Tier 0).** If redroid/scrcpy's codec selection turns out to be
       hardcoded instead of capability-based: patch it.
 
@@ -90,9 +96,11 @@ VA-API didn't allocate can be imported and correctly encoded from — confirmed 
 GPUs (AMD APU, AMD discrete, Intel iGPU) with a synthetic buffer, then confirmed again against a
 real, live dma-buf pulled out of a running redroid container's own gralloc-backed process; and a
 real Codec2 hardware component (`c2.hardware.encoder.h264`) now registers and lists correctly on
-a live redroid instance. Next up: Tier 5 — wiring Tier 2/3's actual VA-API encode logic into the
-Tier 4 component's callbacks, which will also need `libva`/Mesa's VA-API Gallium state tracker
-bundled into the vendor image for the first time (confirmed absent since Tier 0). See
+a live redroid instance. Tier 5 is in progress: a host-side daemon reusing Tier 2/3's encode
+pipeline unchanged (avoiding a much bigger Mesa/LLVM-for-bionic port) is confirmed working,
+byte-identical to Tier 2's own reference output — including from a test binary actually running
+inside Android, talking to the daemon over a Unix socket bridge. Next: the same round trip with a
+real Android gralloc buffer, then wiring it into the Tier 4 component's callbacks. See
 [DEVLOG.md](DEVLOG.md) for the real progress, session by session.
 
 ## Contributing

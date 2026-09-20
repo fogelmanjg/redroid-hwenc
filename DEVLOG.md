@@ -863,3 +863,169 @@ build-vendor.img-and-inject-new-libs dance is any genuinely new shared-library d
 pulls in — most notably `libva`/Mesa's VA-API Gallium state tracker itself, confirmed back in
 Tier 0 to be completely absent from this vendor image today. That's real, known work ahead, not a
 surprise.
+
+## 2026-09-20 (same day) — Tier 5.1: libva builds and installs, first Tier 5 sub-goal closed
+
+Started the Tier 5 plan (broken into sub-goals: 5.1 libva, 5.2 Mesa's VA-API state tracker ported
+to Soong, 5.3 the loadable driver .so, 5.4 a standalone smoke test, 5.5 the real Codec2 component,
+5.6 real end-to-end encode).
+
+**5.1 turned out to be nearly free.** `external/libva` is already AOSP's own official mirror
+(`android.googlesource.com/platform/external/libva`) with a real, working `Android.bp` --
+`va/drm/va_drm.c` (the exact `vaGetDisplayDRM()` code Tier 2/3 already use) is compiled directly
+into the main `libva` module and linked against `libdrm`, no separate `libva-drm` split like the
+desktop packaging convention. The module has `enabled: false` at the top level (same
+disabled-by-default pattern as the Tier 4 service template), but also an
+`arch: { x86_64: { enabled: true } }` override -- and redroid_x86_64 already builds exactly that
+arch, so `m libva` built and installed `vendor/lib64/libva.so` on the very first try, no
+`Android.bp` edit needed at all. Added `PRODUCT_PACKAGES += libva` to `hardware/redroid/c2/c2.mk`
+so it's part of the real product build going forward, not just a one-off `m libva` invocation.
+Skipped `libva-android` (the Gralloc/ANativeWindow display path) -- not needed, Tier 2/3 already
+proved `vaGetDisplayDRM()` works and `/dev/dri/renderD128` is present and usable inside these
+containers.
+
+**One real limitation found trying to hot-deploy into the already-running Tier 4 test
+container**: `docker cp` into a *running* container fails outright
+(`Error response from daemon: openat dev/binder: read-only file system`) when that container has
+external bind-mounted device nodes like the `/dev/binder`/`/dev/vndbinder` binderfs mounts these
+redroid containers all use -- confirmed it's not `/vendor`-specific by testing a trivial file copy
+into `/data` too, same failure. Every successful file injection so far (Tier 4, and this one)
+happened on a container that was `docker create`d but not yet `docker start`ed -- docker cp
+clearly handles that case through a different code path that doesn't trip on the bind mounts.
+Practical rule going forward: file injection into these containers always means
+create-(inject)-start once, never cp into an already-running one.
+
+Next: 5.2, porting Mesa's VA-API Gallium frontend (`external/mesa3d/src/gallium/frontends/va` +
+`targets/va`) to Soong -- real, from-scratch build-file work, unlike 5.1's already-there module.
+
+## 2026-09-20 (same day) — Tier 5 architecture pivot, and 5.2 closed: the host-side encode daemon works
+
+**Found a major scope surprise going into 5.2/5.3 as originally planned.** The plan was to port
+Mesa's VA-API Gallium frontend (`gallium/frontends/va` + `targets/va`, ~40 files) to Soong and link
+it against this build's existing Android-side `radeonsi` driver. Turns out there is no
+Android-side `radeonsi` at all: `external/mesa3d`'s real `Android.bp` (26 files, checked
+systematically -- none under `gallium/drivers` or `gallium/winsys`) only builds the
+`gfxstream`/ANGLE/Vulkan pieces. Real GLES rendering in this build is *forwarded to the host* the
+same way ChromeOS ARC++/the Android Emulator do it -- Android never runs a hardware GPU driver of
+its own. The `radeonsi` source is present (full upstream Mesa mirror), just never wired into the
+Android build at all. Porting the *actual* driver stack (radeonsi + winsys + likely LLVM for its
+shader compiler) to bionic would be a vastly bigger undertaking than the VA-API frontend alone --
+realistically weeks, not sessions.
+
+**Pivoted the whole Tier 5 architecture instead of attempting that port**: since Android's own
+graphics stack already forwards the hard part to the host, do the same thing for encode. A small
+host-side (glibc) daemon does the real VA-API work using the exact pipeline already proven in
+Tier 2/3; the Codec2 component running inside Android (bionic) just becomes a thin client that
+hands it a dma-buf fd over a Unix socket and gets encoded bytes back. This avoids needing *any*
+Mesa/LLVM porting to bionic at all -- the real encode literally runs the same already-working code,
+just called via IPC instead of a direct function call. Revised sub-goal plan: 5.2 the daemon itself
+(this entry), 5.3 bridging the socket into a redroid container + a tiny Android-side test client,
+5.4 the same test against a real Android gralloc buffer, 5.5 wiring this into the Tier 4 component,
+5.6 a real end-to-end app-driven encode.
+
+**5.2 confirmed working on the first real try.** `tier5-vaapi-daemon/daemon.c` wraps the exact
+encode/import logic from `tier2-vaapi-encode`/`tier3-dmabuf-import` (packed SPS/PPS/slice headers,
+`VASurfaceAttribExternalBuffers` + `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME`) in a persistent
+`AF_UNIX`/`SOCK_STREAM` server: one connection = one `EncodeRequest` (dimensions + NV12 plane
+strides) delivered via `sendmsg()` with the dma-buf fd as `SCM_RIGHTS` ancillary data, one
+`EncodeResponse` + Annex-B H.264 bytes back. `tier5-vaapi-daemon/test-client.c` (host-side only,
+no Android yet) builds the same synthetic DRM dumb buffer as the Tier 3 spike, sends it to the
+daemon, and got back **69 bytes, byte-for-byte identical to Tier 2's own reference output** --
+confirmed decodable via `ffprobe`/`ffmpeg`. Ran the client twice in a row against the same daemon
+process to confirm the persistent VA-API context (config/context created once at startup, reused
+across requests) survives repeated requests without issue.
+
+## 2026-09-20 (same day) — Tier 5.3: the Android/host IPC bridge works, confirmed end to end
+
+Closed 5.3: a binary compiled for Android (bionic, via Soong) and run *inside* a redroid
+container talked to the host-side daemon over the shared Unix socket and got back a real,
+correct H.264 encode.
+
+**Bridging the socket into the container**: bind-mounted the daemon's socket directory
+(`/dev/vaapi-helper`) into a fresh test container the same way these containers already bind-mount
+`/dev/binder` — no surprises there, plain Docker bind mount.
+
+**The Android-side test client is nearly the exact same C code as the host-side one**
+(`external/vaapi_codec2/test-client/test_client.c`, copied from
+`tier5-vaapi-daemon/test-client.c`): same synthetic DRM dumb buffer creation, same `sendmsg()` +
+`SCM_RIGHTS` protocol. Confirms `AF_UNIX`/`SCM_RIGHTS`/`libdrm` all behave identically under
+bionic vs glibc for this — no bionic-specific surprises here, unlike the Mesa/radeonsi situation.
+
+**Two more real deployment lessons, both about `/vendor` specifically:**
+1. `docker cp` into an *already-booted* container fails outright for any path once Android has
+   fully started -- not just the binder-bind-mount issue found in Tier 4, but specifically because
+   `/vendor` itself becomes genuinely read-only at the Android/kernel level after boot (confirmed:
+   `mount -o remount,rw /vendor` reports `/vendor` isn't even a separate entry in
+   `/proc/mounts` -- it's baked into the same flattened rootfs, and something in the boot process
+   still marks it read-only). `/data` stays writable throughout, matching real device behavior.
+   Practical rule: `/vendor` changes always need a full recreate (create → inject while stopped →
+   start once); `/data` can be hot-patched via `docker exec -i ... sh -c "cat > path" < localfile`
+   at any time, including while the container is already running and booted.
+2. `docker exec -i <container> sh -c "cat > /path/to/file" < local-file` is a reliable substitute
+   for both `docker cp` (broken on these containers per Tier 4's finding) and `adb push` (broken by
+   the recurring adb "device offline" flakiness this host has been hitting all session) for getting
+   a file into a *writable* path on an already-running container. Used to push the test binary to
+   `/data/local/tmp` and run it directly via `docker exec`, sidestepping adb entirely.
+3. Forgot to also inject `libdrm.so` alongside `libva.so` on the first attempt at this container
+   (it's a new dependency `libva`'s build itself pulled in, same "diff the mounted vendor.img
+   against the running container" lesson as Tier 4's 16 missing libraries, just one file this
+   time) -- caught it via `CANNOT LINK EXECUTABLE ... library "libdrm.so" not found`, same failure
+   signature as before.
+
+**Result, byte-for-byte identical to the very first Tier 2 reference output**: 69 bytes, decodes
+cleanly, confirmed via `diff` against `tier2-vaapi-encode/out.h264`. The IPC bridge across the
+Android/host boundary is solid.
+
+Next: 5.4, the same round trip but with a dma-buf fd that actually came from an Android-allocated
+gralloc buffer instead of this checkpoint's synthetic DRM dumb buffer.
+
+## 2026-09-20 (same day) — Tier 5.4: a real Android gralloc dma-buf encodes correctly too
+
+Closed 5.4: sent a dma-buf fd that actually came from an Android-allocated gralloc buffer
+(not a synthetic DRM dumb buffer) to the daemon and got back a correct, decodable encode.
+
+**Getting the buffer the right way this time.** Tier 3's real-gralloc spike had to scavenge a
+dma-buf fd out of a live process's fd table via `pidfd_getfd` because there was no way to write
+and build native Android code at that point in the project. Now that the full AOSP tree is
+available, this is much cleaner: `AHardwareBuffer_allocate()` with
+`AHARDWAREBUFFER_USAGE_VIDEO_ENCODE` allocates a real gralloc buffer directly, and
+`AHardwareBuffer_getNativeHandle()` (from `vndk/hardware_buffer.h`, the vendor-facing half of the
+API) gives the dma-buf fd straight from the native handle -- no scavenging needed.
+`libnativewindow` (which implements both) is LLNDK, explicitly meant to be linked from vendor
+code, so this needed no special Soong permissions.
+
+**Two real, worth-remembering findings hit along the way, neither of them blockers:**
+
+1. **`AHardwareBuffer_lockPlanes()` isn't implemented on this build's Mapper HAL** (returns -38/
+   ENOSYS) -- this build only registers `android.hardware.graphics.mapper@2.0-impl-2.1`, and that
+   version apparently doesn't implement the flexible-layout/lockYCbCr verb the newer API needs.
+   Not fatal: we don't actually need AHardwareBuffer's own CPU-access API at all -- the dma-buf fd
+   from `getNativeHandle()` supports a plain `mmap()` directly, exactly the same way every other
+   tier has filled a foreign dma-buf without any higher-level API involvement.
+2. **Requesting `AHARDWAREBUFFER_FORMAT_Y8Cb8Cr8_420` (flexible YUV420) returns a buffer sized
+   like RGBA8888** (307200 bytes for 320x240, i.e. `width*height*4`) instead of NV12's expected
+   `width*height*1.5` (115200) -- the same "this generic graphics stack doesn't really support YUV
+   allocation" pattern the very first Tier 3 spike hit with Mesa's GBM (only RGB(A) formats
+   allocatable there too). Not chased further since the buffer is still large enough and still a
+   genuine gralloc-backed dma-buf -- just filled the first `width*height*1.5` bytes of it as NV12
+   ourselves.
+3. **The dma-buf import itself failed on the first attempt** with the exact tightly-packed stride
+   (320, no padding) `AHardwareBuffer_describe()` reported: `"resource allocation failed"`.
+   Isolated the actual cause carefully before assuming it was about this buffer's origin: forced
+   the *known-good* synthetic DRM dumb buffer (which normally imports and encodes fine) to lie
+   about its own stride as 320 instead of its real 512, and got the identical failure. This proves
+   it's a VA-API/radeonsi pitch *alignment* requirement, not anything about gralloc-sourced buffers
+   being fundamentally incompatible for import. Fix (valid for this test since we control the
+   fill): use an aligned stride (512, matching what already works) instead of the tight one when
+   filling and describing the buffer -- the real buffer has more than enough bytes (307200) for
+   that padded layout (184320 needed). **Worth remembering for Tier 5.5/5.6**: a real Codec2
+   encoder input buffer's actual stride is decided by whatever gralloc/BufferQueue producer created
+   it, not by us -- if a real production buffer ever arrives with a misaligned stride, the daemon
+   will need to either reject it clearly or do an internal copy into an aligned staging buffer
+   before import, rather than assuming Tier 5.4's "we control the fill" luxury.
+
+**Result**: 69 bytes, byte-for-byte identical to Tier 2's reference output, confirmed decodable --
+from a real Android-allocated dma-buf this time, obtained the correct way.
+
+Next: 5.5, wiring this client logic into `tier4-codec2-skeleton`'s `createComponent()` for a real
+Codec2 component.

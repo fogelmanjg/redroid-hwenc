@@ -1,0 +1,62 @@
+// Tier 5.3 checkpoint: confirms the Unix-socket bridge to the host-side
+// VA-API encode daemon (tier5-vaapi-daemon) works from *inside* Android
+// (bionic), not just from a plain host-side glibc program. Same protocol,
+// same synthetic dma-buf approach as the host-side test-client.c -- a real
+// Android gralloc buffer is Tier 5.4's concern, this checkpoint is purely
+// about the IPC bridge itself.
+
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+cc_binary {
+    name: "vaapi_daemon_test_client",
+    vendor: true,
+
+    srcs: [
+        "test_client.c",
+    ],
+
+    shared_libs: [
+        "libdrm",
+    ],
+    header_libs: [
+        "libdrm_headers",
+    ],
+}
+
+// Tier 5.4 step 1: pure diagnostic, no daemon involved yet -- see
+// real_gralloc_probe.c for why. libnativewindow is LLNDK (explicitly
+// meant to be usable from vendor code), so this links against it directly.
+cc_binary {
+    name: "real_gralloc_probe",
+    vendor: true,
+
+    srcs: [
+        "real_gralloc_probe.c",
+    ],
+
+    shared_libs: [
+        "libnativewindow",
+    ],
+    header_libs: [
+        "libcutils_headers",
+    ],
+}
+
+// Tier 5.4: sends a real AHardwareBuffer-backed dma-buf to the daemon.
+cc_binary {
+    name: "real_gralloc_client",
+    vendor: true,
+
+    srcs: [
+        "real_gralloc_client.c",
+    ],
+
+    shared_libs: [
+        "libnativewindow",
+    ],
+    header_libs: [
+        "libcutils_headers",
+    ],
+}
