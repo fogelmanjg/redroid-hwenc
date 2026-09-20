@@ -54,6 +54,12 @@ Each tier assumes the previous one is done. ⭐ marks the highest-leverage check
       VA-API can import zero-copy, inside a container with the same privileges as redroid?
       Nobody confirmed this in 4 years of issues. redroid runs as a container (not a VM) — no
       virtio-gpu in the way, a better starting point than the community seems to assume.
+      **Mechanism confirmed working across three real GPUs** (AMD Renoir APU, AMD Polaris10
+      discrete, Intel TigerLake-LP iGPU): an externally-allocated (non-libva) dma-buf imports into
+      a VA-API surface and encodes correctly on all three — output byte-identical to a fully
+      VA-API-native run in every case. Still open: confirming this against a *real* dma-buf pulled
+      from redroid's own Android-side gralloc, not a generic DRM dumb buffer. See
+      [tier3-dmabuf-import/README.md](tier3-dmabuf-import/README.md).
 - [ ] **Tier 4 — Codec2 skeleton in Android.** A component that Android recognizes and lists
       (`dumpsys media.c2`) as `c2.hardware.encoder.h264`, without real encoding wired in yet.
 - [ ] **Tier 5 — Real integration.** Tier 3 + Tier 2 wired into the callbacks of the Tier 4
@@ -68,9 +74,11 @@ has been documented by anyone until now.
 
 Tiers 0-2 done: Codec2 hardware-encode gap root-caused and fixed across AMD/Intel/NVIDIA, and a
 standalone VA-API H.264 encoder proven working end to end on real hardware (verified decodable
-output, not just successful API calls). Tier 3 — the make-or-break check of whether a redroid
-gralloc buffer's dma-buf can be imported zero-copy into a VA-API surface — is next. See
-[DEVLOG.md](DEVLOG.md) for the real progress, session by session.
+output, not just successful API calls). Tier 3 — whether a dma-buf VA-API didn't allocate can be
+imported and correctly encoded from — is confirmed working with a generic DRM buffer across three
+real GPUs (AMD APU, AMD discrete, Intel iGPU); what's left is confirming the same result against a
+real dma-buf pulled from redroid's own Android-side gralloc. See [DEVLOG.md](DEVLOG.md) for the
+real progress, session by session.
 
 ## Contributing
 

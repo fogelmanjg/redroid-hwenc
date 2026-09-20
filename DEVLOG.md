@@ -583,3 +583,95 @@ the multi-call `vaRenderPicture` pattern). Tier 3 swaps the synthetic NV12 test 
 dma-buf imported from a redroid Codec2 buffer (`VASurfaceAttribExternalBuffers` +
 `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME`) — everything downstream of surface creation in this file
 carries over unchanged.
+
+## 2026-09-20 — Tier 3: dma-buf import confirmed working end to end on real hardware
+
+Built `tier3-dmabuf-import/main.c` to answer the actual make-or-break question: can VA-API import
+a dma-buf it did **not** allocate, and actually encode from it correctly.
+
+**First attempt used Mesa GBM as the stand-in for "a gralloc buffer" and hit a wall immediately.**
+`gbm_bo_create(gbm, W, H, GBM_FORMAT_NV12, GBM_BO_USE_LINEAR)` failed outright. A quick diagnostic
+sweep (`gbm_device_is_format_supported` across `0`, `LINEAR`, `RENDERING`, `SCANOUT`, and
+combinations) showed NV12 is unsupported for *any* usage flags on this radeonsi/Mesa gbm backend —
+only RGB8888/ARGB8888 are allocatable through generic libgbm on this GPU. Real finding, not a dead
+end: whatever allocator redroid's Android-side gralloc uses for YUV buffers, it is **not** the same
+generic libgbm path used here, since that path can't produce NV12 on this hardware at all. Still
+open which allocator gralloc actually uses and whether it hits the same wall — next session's
+"pull a real dma-buf out of a running container" step should answer this directly.
+
+**Pivoted to a plain DRM dumb buffer** (`DRM_IOCTL_MODE_CREATE_DUMB` on the primary node,
+`/dev/dri/card1`) instead — allocator-agnostic, always linear, available on any DRM driver
+regardless of what Mesa's gbm winsys supports. Laid out as `WIDTH x (HEIGHT * 3/2)` at 8bpp, which
+is exactly NV12's Y+interleaved-UV byte layout. Exported via `drmPrimeHandleToFD` — the same
+mechanism a gralloc buffer's native handle uses per the Tier 1 finding that `handle->data[i]` on a
+`C2ConstGraphicBlock` are dma-buf fds directly.
+
+**The import itself succeeded on the first working try**: `vaCreateSurfaces` with
+`VASurfaceAttribExternalBuffers` + `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME`, pointed at a dma-buf fd
+VA-API had zero part in creating, returned `VA_STATUS_SUCCESS`.
+
+**One planned check didn't work**: `vaDeriveImage` on the imported surface fails with
+`VA_STATUS_ERROR_OPERATION_FAILED`, so the originally planned "write via plain mmap of the
+dma-buf fd, read back via VA-API" CPU-side coherency check had to be skipped. This radeonsi driver
+apparently doesn't support direct CPU-mapping of a PRIME-imported surface, even though — as the
+next result shows — the surface is completely usable as encode input. Worth remembering as its own
+sharp edge: "import succeeds, but you can't `vaDeriveImage` it" is a real, non-fatal driver
+limitation, not a sign the import is broken.
+
+**The actual test that matters: feeding the imported surface through the exact Tier 2 encode
+sequence (packed SPS/PPS/slice headers, the multi-call `vaRenderPicture` split, unchanged) produced
+output that is byte-for-byte identical to Tier 2's fully VA-API-native run** — same 69-byte
+Annex-B stream. Decoding both and comparing pixel values confirms the same result too: 130,
+Tier 2's documented QP26-quantization rounding of the fed-in flat 128. The hardware encoder
+genuinely read real pixel data out of a dma-buf it never allocated and produced a result
+indistinguishable from the "normal" path — not zeros, not garbage, not a silent no-op.
+
+**What this settles, and what's still open:** on this AMD/radeonsi hardware, the *mechanism* Tier 3
+exists to check — VA-API importing and correctly encoding from a foreign dma-buf — is confirmed
+working. What's not yet confirmed is that the buffer came from redroid's actual Android gralloc:
+a DRM dumb buffer is linear and allocator-agnostic, not necessarily the same tiling/layout a real
+`AHardwareBuffer` allocation would produce. Next step: get a real dma-buf fd out of a running
+redroid container (allocate an `AHardwareBuffer` via NDK inside the container, extract its native
+handle's fd, hand it to this same import path from the host) and confirm it behaves the same way.
+See `tier3-dmabuf-import/README.md` for the full writeup.
+
+## 2026-09-20 (same day) — Cross-hardware validation: Tier 3 mechanism reproduces on a discrete AMD GPU too
+
+Ran the exact same `tier3-dmabuf-import` spike (only change: `/dev/dri/card1` → `/dev/dri/card0`,
+this host's primary node) on `jgustavo46`, which has a genuinely different GPU generation — a
+discrete **AMD Radeon RX 480 (Polaris10)**, not the Renoir APU used for the original spike. Ran
+Tier 2's standalone encoder first as a same-host baseline (70 bytes, decodable), then Tier 3.
+
+**Same result as server01, exactly:** dma-buf import via `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME`
+succeeded, `vaDeriveImage` on the imported surface failed the same way (non-fatal), and the encode
+from the imported surface produced output **byte-for-byte identical** to this machine's own Tier 2
+baseline (70 bytes here, vs. 69 on server01's Renoir APU — the 1-byte difference is expected, it's
+a different GPU/driver build, not a discrepancy within the same host). Confirms this isn't a
+Renoir-specific fluke: the same PRIME-import mechanism, the same "import works but derive doesn't"
+sharp edge, and the same "encoder genuinely reads real imported pixel data" result hold across two
+different radeonsi-supported GPU generations (Vega-based APU vs. Polaris discrete).
+
+## 2026-09-20 (same day) — Cross-hardware validation: reproduces on Intel iGPU too, and the CPU-readback check actually passes there
+
+Same spike, third GPU: `jfogelman-n02`'s Intel Iris Xe (TigerLake-LP, `iHD` driver), woken via
+WoL for this test. Same procedure (Tier 2 baseline first, then Tier 3), same result pattern —
+`vaCreateSurfaces` with `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME` imports the DRM dumb buffer, and the
+resulting encode is byte-for-byte identical to this host's own Tier 2 baseline (63 bytes both
+times). Uses `VAEntrypointEncSliceLP` as expected (Tier 0's Intel/AMD entrypoint split, confirmed
+again here).
+
+**One difference from both AMD/radeonsi runs (Renoir APU and Polaris10 discrete): `vaDeriveImage`
+on the imported surface actually *succeeded* here**, so the originally-planned CPU-side coherency
+check (write via plain `mmap()` of the dma-buf fd, read back via `vaMapBuffer`) ran to completion
+and reported PASS — direct confirmation the VA-API surface aliases the exact same memory the mmap
+write touched, not a driver-side copy. On radeonsi this check had to be skipped because
+`vaDeriveImage` errored on an imported surface there (see the two entries above) — worth noting as
+a real per-vendor difference: Intel's `iHD` driver supports direct CPU-mapping of a PRIME-imported
+surface, this AMD radeonsi build (both GPU generations tested) does not, even though both are
+equally capable of *encoding* from that same imported surface correctly.
+
+**Net result across three real GPUs (AMD Renoir APU, AMD Polaris10 discrete, Intel TigerLake-LP
+iGPu):** the Tier 3 mechanism — importing a dma-buf VA-API never allocated and correctly hardware-
+encoding from it — holds on every one of them. The remaining open item is unchanged from the first
+entry today: confirming this against a real dma-buf pulled from redroid's own Android-side gralloc,
+not a generic DRM dumb buffer.
