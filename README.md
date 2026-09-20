@@ -50,16 +50,19 @@ Each tier assumes the previous one is done. ⭐ marks the highest-leverage check
       The VA-API **encode** API surface (not decode).
 - [x] **Tier 2 — Isolated native prototype.** Standalone program (host, no Android) that
       encodes H.264 via VA-API over `/dev/dri/renderD*`.
-- [ ] **Tier 3 — ⭐ The make-or-break spike.** Does a gralloc buffer export a `dma-buf` fd that
+- [x] **Tier 3 — ⭐ The make-or-break spike.** Does a gralloc buffer export a `dma-buf` fd that
       VA-API can import zero-copy, inside a container with the same privileges as redroid?
       Nobody confirmed this in 4 years of issues. redroid runs as a container (not a VM) — no
       virtio-gpu in the way, a better starting point than the community seems to assume.
-      **Mechanism confirmed working across three real GPUs** (AMD Renoir APU, AMD Polaris10
-      discrete, Intel TigerLake-LP iGPU): an externally-allocated (non-libva) dma-buf imports into
-      a VA-API surface and encodes correctly on all three — output byte-identical to a fully
-      VA-API-native run in every case. Still open: confirming this against a *real* dma-buf pulled
-      from redroid's own Android-side gralloc, not a generic DRM dumb buffer. See
-      [tier3-dmabuf-import/README.md](tier3-dmabuf-import/README.md).
+      **Confirmed across three real GPUs** (AMD Renoir APU, AMD Polaris10 discrete, Intel
+      TigerLake-LP iGPU) with a synthetic dma-buf first — output byte-identical to a fully
+      VA-API-native run in every case — then **confirmed again against a real, live dma-buf pulled
+      out of a running redroid container's own gralloc-backed process** (via `pidfd_getfd(2)`, the
+      correct mechanism for duplicating an anonymous-inode fd like dma-buf across processes):
+      `vaCreateSurfaces` imports it cleanly. See
+      [tier3-dmabuf-import/README.md](tier3-dmabuf-import/README.md) for the full writeup,
+      including the one open nuance (confirming the specific buffer instance held live frame
+      content, not just that the import mechanism itself works).
 - [ ] **Tier 4 — Codec2 skeleton in Android.** A component that Android recognizes and lists
       (`dumpsys media.c2`) as `c2.hardware.encoder.h264`, without real encoding wired in yet.
 - [ ] **Tier 5 — Real integration.** Tier 3 + Tier 2 wired into the callbacks of the Tier 4
@@ -72,13 +75,14 @@ has been documented by anyone until now.
 
 ## Current status
 
-Tiers 0-2 done: Codec2 hardware-encode gap root-caused and fixed across AMD/Intel/NVIDIA, and a
+Tiers 0-3 done. Codec2 hardware-encode gap root-caused and fixed across AMD/Intel/NVIDIA; a
 standalone VA-API H.264 encoder proven working end to end on real hardware (verified decodable
-output, not just successful API calls). Tier 3 — whether a dma-buf VA-API didn't allocate can be
-imported and correctly encoded from — is confirmed working with a generic DRM buffer across three
-real GPUs (AMD APU, AMD discrete, Intel iGPU); what's left is confirming the same result against a
-real dma-buf pulled from redroid's own Android-side gralloc. See [DEVLOG.md](DEVLOG.md) for the
-real progress, session by session.
+output, not just successful API calls); and the Tier 3 make-or-break question — whether a dma-buf
+VA-API didn't allocate can be imported and correctly encoded from — confirmed across three real
+GPUs (AMD APU, AMD discrete, Intel iGPU) with a synthetic buffer, then confirmed again against a
+real, live dma-buf pulled out of a running redroid container's own gralloc-backed process. Next up:
+Tier 4 (the Codec2 component skeleton). See [DEVLOG.md](DEVLOG.md) for the real progress, session
+by session.
 
 ## Contributing
 

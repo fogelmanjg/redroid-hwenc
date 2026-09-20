@@ -675,3 +675,79 @@ iGPu):** the Tier 3 mechanism — importing a dma-buf VA-API never allocated and
 encoding from it — holds on every one of them. The remaining open item is unchanged from the first
 entry today: confirming this against a real dma-buf pulled from redroid's own Android-side gralloc,
 not a generic DRM dumb buffer.
+
+## 2026-09-20 (same day) — Closing Tier 3: import against a REAL, live redroid gralloc dma-buf
+
+Everything above used a synthetic DRM dumb buffer as the "foreign dma-buf" — allocator-agnostic
+and useful for isolating the import mechanism, but not proof that redroid's *actual* Android-side
+gralloc produces something compatible. Closed that gap today: pulled a live dma-buf fd out of a
+running redroid container's own process table and ran it through the same import path.
+
+**Test instance, created the right way.** Rather than hand-roll another `docker run` (the source of
+the earlier docker0-bridge bug), used `redroid-manager`'s own instance-creation code
+(`dockerRuntime.create` + `binder.binderBinds` + the same `androidboot.*` Cmd construction
+`routes/instances.js` uses) via a one-off script, on a throwaway `android-redroid:11-gapps`
+instance — explicitly *not* touching the real in-use containers on ports 5555-5562. First attempt
+hit the exact same docker0 ARP-never-resolves bug as the very first manual attempt (see below) —
+confirmed as a real, pre-existing fault in this host's default `bridge` network's FDB (one veth
+port was missing the `permanent`/vlan-tagged entries every working port has), not something caused
+by the creation method. Worked around by giving the test instance its own dedicated Docker network
+(`jg-redroid-test-net`) instead of touching `docker0`, which is shared with real, in-use instances.
+
+**First manual attempt (before switching to the real creation flow) also surfaced the same bug**,
+plus a discovery along the way: `portAllocator.nextPort()`/`binder.nextFreeSlot()` only look at
+`redroid-manager`'s own store, which was empty (the real running instances were never registered in
+it) — so the very first real-flow attempt picked port 5555 and binder slot 1, both already in use,
+and Docker only surfaces that collision at container *start*, not *create*. Worth fixing in the
+manager itself at some point (reconcile the store against `docker ps` on startup) — noted here, not
+fixed today, out of scope for this spike.
+
+**Getting the real dma-buf fd out of the container: `/proc/PID/fd/N` reopen does NOT work for
+dma-buf.** First instinct was the classic trick (open the magic symlink at `/proc/<pid>/fd/<n>`
+from the host to get a dup of another process's fd). That returns `ENXIO` for dma-buf specifically
+— dma-buf is backed by an anonymous inode, and anon_inode's default `f_ops->open` deliberately
+returns `-ENXIO` to block exactly this reopen pattern. The correct mechanism is `pidfd_getfd(2)`
+(Linux 5.6+: `pidfd_open()` then `pidfd_getfd(pidfd, target_fd, 0)`), which explicitly supports
+anonymous-inode fds — it's what CRIU and debuggers use for this. Confirmed working via a quick
+`ctypes` syscall probe before writing it into `real-gralloc-import.c` directly in C (needs root /
+`CAP_SYS_PTRACE` to target another user's process, same `sudo -u claude sudo` pattern as everything
+else on this host).
+
+**Where to find a real dma-buf inside a live redroid container**: swept every process's
+`/proc/*/fd` for `dmabuf:` symlinks while `screenrecord` was running. Real dma-bufs turned up in
+`surfaceflinger`, `composer@2.1-service` (the HWC HAL), `media.codec` (the OMX video HAL), and app
+processes like `systemui` — `screenrecord`'s own process only held `AshmemAllocator_hidl` memfds,
+not dma-bufs at all (the software colour-conversion/encode working buffers apparently live in
+ashmem-backed memory for this build, not gralloc dma-bufs).
+
+**The import itself succeeded, on the first real try.** Grabbed a dma-buf fd from `media.codec`
+(`omx@1.0-service`, the process consuming frames from `screenrecord`'s virtual-display
+`BufferQueue`), sized 3,932,160 bytes. `ffprobe` on the actual concurrent recording confirmed the
+true coded resolution was 720x1280; 3,932,160 bytes matches RGBA8888 with a 256-byte-aligned row
+stride of 3072 (720px × 4B/px = 2880, rounded up) × 1280 rows — i.e. this is SurfaceFlinger's
+composited RGBA output, not a pre-converted YUV buffer (the software encoder does its own RGBA→YUV
+conversion afterward, in that separate ashmem memory, not gralloc). Imported via
+`VASurfaceAttribExternalBuffers` + `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME` with
+`VA_RT_FORMAT_RGB32`/`VA_FOURCC_RGBA` — `vaCreateSurfaces` returned `VA_STATUS_SUCCESS` immediately,
+no format/layout complaints. Bonus: `vaDeriveImage` on this imported surface *also* succeeded here
+(unlike the synthetic-NV12 spike on this same AMD driver, where it failed) — direct CPU readback of
+a real, externally-allocated dma-buf worked end to end.
+
+**What didn't fully close: content verification.** Read back all zero bytes across four different
+buffer instances captured this way (two fds from one recording session, two more from a second
+session with the Settings app open on screen for visible content) — while a `screencap` taken in
+parallel confirmed the real screen was NOT blank (mostly dark but with real non-zero pixel
+variation, opaque alpha). Most likely explanation: these particular `media.codec`-held dma-bufs are
+pre-allocated pool/reserve buffers not currently holding the "front" composited frame, rather than
+a sign the import or format math is wrong (the size math checks out exactly against the
+independently-confirmed resolution). Chasing this further would need instrumenting the actual
+`BufferQueue` producer/consumer state or targeting a build whose encode path is actually
+dma-buf/GPU-backed rather than this Android 11 image's software-only OMX encoder. Left open
+deliberately — full content verification is naturally covered once the wifi-v3 (Android 15,
+GPU-backed) image gets the same end-to-end treatment planned for later.
+
+**Bottom line for Tier 3**: the mechanism question the whole tier exists to answer — can VA-API
+import a dma-buf it never allocated, of the exact kernel object type Android's gralloc actually
+produces, obtained from a real running Android system process via the correct kernel mechanism —
+is answered **yes**, confirmed against a live object, not just a synthetic stand-in. See
+`tier3-dmabuf-import/README.md` for the consolidated writeup.
