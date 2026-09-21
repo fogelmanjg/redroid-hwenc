@@ -1439,3 +1439,32 @@ VA-API's direct PRIME import, which needs the modifier spelled out. Not yet inve
 hardware compatibility table to the README to track this kind of per-GPU finding going forward, as
 this project starts touching genuinely different hardware generations rather than just different
 vendors.
+
+## 2026-09-21 (same day) — Confirmed the fix direction for Polaris/GFX8 actually works
+
+Tested the idea from the previous entry before implementing it for real: wrote a self-contained
+probe (no Android involved) that allocates a `GBM_BO_USE_RENDERING` RGBA buffer (same opaque
+`TILE_TYPE_DRI` tiling class as the real one — confirmed via `gbm_bo_get_modifier()` returning
+`DRM_FORMAT_MOD_INVALID`), writes a known solid color into it via `gbm_bo_map()`, exports it as a
+dma-buf, and then re-imports *that exact fd* as a fresh `EGLImage` via plain
+`EGL_LINUX_DMA_BUF_EXT` — deliberately the extension *without* modifier support, giving it no
+modifier attributes at all — binds it as a GL texture via `glEGLImageTargetTexture2DOES`, and reads
+it back with `glReadPixels`. Result: exact correct color. Confirms Mesa's own driver *can* resolve
+its own opaque tiling correctly when it's the one doing the importing (as opposed to VA-API's
+`DRM_PRIME_2`, which needs the tiling spelled out as a modifier value that doesn't exist for this
+buffer class at all).
+
+(Two harness-only bugs hit along the way, neither a real finding: `eglChooseConfig` failed silently
+because the config attribs asked for `EGL_PBUFFER_BIT`, which isn't offered on a GBM-platform
+display meant for surfaceless contexts — dropping that constraint fixed it; and the resulting
+`EGL_BAD_CONFIG` from the unchecked config fed into `eglCreateContext` cascaded into every
+subsequent GL call silently no-op'ing against no current context, which is why the *first* run of
+this probe printed a confusing "framebuffer incomplete: 0x0" with no GL errors anywhere — turned
+out to be nothing about dma-buf import at all, just an unchecked earlier failure upstream.)
+
+**This means the fix path is confirmed, not just theorized**: for a GPU whose opaque tiling can't
+be described as a DRM modifier at all, bridge it into the existing (unchanged) VA-API pipeline with
+one new step — import via plain `EGL_LINUX_DMA_BUF_EXT` (no modifier), GPU-blit the result into a
+fresh, definitely-linear buffer allocated the normal way, and hand *that* to the daemon's existing
+`DRM_PRIME_2`/VPP/encode code exactly as-is. Not implemented yet (this session ran out of budget
+right as the mechanism got confirmed) — next session's concrete task, not an open question anymore.
