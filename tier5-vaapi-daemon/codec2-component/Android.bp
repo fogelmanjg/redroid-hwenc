@@ -27,9 +27,6 @@ cc_library_static {
     export_shared_lib_headers: [
         "libcodec2_soft_common",
     ],
-    header_libs: [
-        "minigbm_headers",
-    ],
 
     cflags: [
         "-Wall",

@@ -15,8 +15,6 @@
 #include <media/stagefright/MediaDefs.h>
 #include <util/C2InterfaceHelper.h>
 
-#include <cros_gralloc/cros_gralloc_handle.h>
-
 #include "protocol.h"
 
 namespace android {
@@ -211,13 +209,7 @@ void VaapiEncComponent::process(const std::unique_ptr<C2Work> &work,
     // small struct of dma-buf fds, no mapper call needed. Deliberately does
     // NOT call block.map()/layout() -- this build's Mapper HAL doesn't
     // implement the flexible-layout verb that needs (confirmed ENOSYS in the
-    // Tier 5.4 gralloc probe). Tier 5.7 finding: this gralloc (cros_gralloc,
-    // from external/minigbm) packs the real width/height/strides/offsets AND
-    // the DRM format modifier directly into its own native_handle_t layout
-    // (cros_gralloc_handle.h) -- reading that struct directly gets the real
-    // metadata instead of guessing a stride, which silently produced a
-    // garbled/tiled-as-linear decode for any buffer gralloc didn't allocate
-    // LINEAR (confirmed: a real Surface-sourced frame from scrcpy).
+    // Tier 5.4 gralloc probe).
     C2ConstGraphicBlock block = inputBuffer->data().graphicBlocks().front();
     const C2Handle *const handle = block.handle();
     if (!handle || handle->numFds < 1) {
@@ -226,35 +218,48 @@ void VaapiEncComponent::process(const std::unique_ptr<C2Work> &work,
         work->workletsProcessed = 1u;
         return;
     }
-    // Tier 5.7 finding: a real Surface-sourced frame (scrcpy's virtual
-    // display capture via GraphicBufferSource) does NOT arrive as a full
-    // cros_gralloc_handle here -- a raw dump showed only 23 payload ints
-    // (92 bytes) vs. the 144 needed for that struct, and the values present
-    // (a 2560-byte stride against a 640-pixel width -- exactly 4 bytes/px)
-    // point to this buffer being RGBA, not NV12. Our interface never
-    // declared a pixel format, so CCodec left the input as
+    // Tier 5.8 finding: a real Surface-sourced frame (scrcpy's virtual
+    // display capture via GraphicBufferSource) does NOT arrive as a
+    // cros_gralloc_handle at all -- confirmed authoritatively via
+    // cros_gralloc's own cros_gralloc_convert_handle() validation logic
+    // (cros_gralloc_helpers.cc), which requires the handle's total size to
+    // exactly equal sizeof(cros_gralloc_handle) (156 bytes); this one
+    // measures 108 (numFds=1, numInts=23). It's some other, more generic
+    // native_handle_t this pipeline uses when a buffer crosses into this
+    // process a different way, not this vendor's own gralloc wire format.
+    // Reading it structurally isn't possible without knowing that format;
+    // these offsets are empirical (dumped the raw ints and matched them
+    // against the buffer's known config: 600x1000, and a 2560-byte stride
+    // that lines up with a 640px-wide RGBA plane -- exactly 4 bytes/px).
+    // The buffer is RGBA, not NV12/YUV, because CCodec left the input as
     // OMX_COLOR_FormatAndroidOpaque (confirmed in logcat:
-    // color-format = 2130708361) and GraphicBufferSource handed us
-    // SurfaceFlinger's raw GL-composited output instead of running its own
-    // RGBA->YUV conversion pass. The cros_gralloc_handle cast below is
-    // therefore WRONG for this real-buffer case (worked only for the
-    // earlier tiers' self-allocated test buffers) -- left in place as the
-    // last known-working step; next tier needs to either force real YUV
-    // output (find what makes GraphicBufferSource convert) or accept RGBA
-    // and convert before handing frames to the VA-API daemon.
-    cros_gralloc_handle_t crosHandle = reinterpret_cast<cros_gralloc_handle_t>(handle);
-    int dmabufFd = crosHandle->fds[0];
-    uint32_t width = crosHandle->width;
-    uint32_t height = crosHandle->height;
-    uint32_t strideY = crosHandle->strides[0];
-    uint32_t strideUv = crosHandle->num_planes > 1 ? crosHandle->strides[1] : strideY;
-    uint32_t offsetUv = crosHandle->num_planes > 1 ? crosHandle->offsets[1] : 0;
-    uint32_t dmabufSize = crosHandle->total_size;
-    uint64_t drmFormatModifier = crosHandle->format_modifier;
+    // color-format = 2130708361): this Mesa/minigbm stack can't allocate a
+    // buffer that's both GPU-renderable and real YUV at once (see DEVLOG),
+    // so GraphicBufferSource hands over SurfaceFlinger's raw GL-composited
+    // RGBA output instead. drm_format_modifier is left at 0 (LINEAR) since
+    // this handle format has no identifiable modifier field at all, so the
+    // real modifier can't be read from it. Determined it a different way
+    // instead: minigbm's amdgpu.c registers one combination per modifier
+    // Mesa reports via dri_query_modifiers() for a GPU-render-target ABGR
+    // buffer, all sharing the same priority -- drv_get_combination() (in
+    // drv.c) breaks priority ties by taking the FIRST-registered match, so
+    // whichever modifier Mesa returns first for this format/GPU is the one
+    // that wins. Queried Mesa directly for that order (eglQueryDmaBufModifiersEXT
+    // for DRM_FORMAT_ABGR8888 on this exact GPU, with AMD_DEBUG=nodcc set the
+    // same way surfaceflinger has it): 4 modifiers, all DCC=0 (confirms nodcc
+    // affects this list, not just the encode-time DCC check), first one
+    // 0x0200000000401a01 (AMD_FMT_MOD_TILE_VER_GFX9, tile=GFX9_64K_D_X).
+    int dmabufFd = handle->data[0];
+    const int32_t *ints = &handle->data[handle->numFds];
+    uint32_t width = (uint32_t)ints[2];
+    uint32_t height = (uint32_t)ints[3];
+    uint32_t strideY = (uint32_t)ints[6];
+    uint32_t dmabufSize = strideY * height;
+    uint64_t drmFormatModifier = 0x0200000000401a01ULL; /* GFX9_64K_D_X, DCC=0 */
 
     unsigned char *coded = nullptr;
-    long codedSize = encodeViaDaemon(dmabufFd, width, height, strideY, strideUv, offsetUv,
-                                      dmabufSize, drmFormatModifier, &coded);
+    long codedSize = encodeViaDaemon(dmabufFd, width, height, strideY, /*strideUv=*/0,
+                                      /*offsetUv=*/0, dmabufSize, drmFormatModifier, &coded);
     if (codedSize < 0) {
         work->result = C2_CORRUPTED;
         work->workletsProcessed = 1u;

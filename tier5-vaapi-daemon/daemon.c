@@ -29,6 +29,7 @@
 #include <va/va_drm.h>
 #include <va/va_drmcommon.h>
 #include <va/va_enc_h264.h>
+#include <va/va_vpp.h>
 #include <drm/drm_fourcc.h>
 
 #include "protocol.h"
@@ -205,7 +206,19 @@ typedef struct {
     VAEntrypoint entrypoint;
     VAConfigID config_id;
     VAContextID context_id;
-    VASurfaceID surfaces[2]; /* [0] = imported input (recreated per request), [1] = recon */
+    /* Tier 5.8: a real Surface-sourced frame is RGBA, not NV12 (Tier 5.7's
+     * closing finding) -- this driver's own VAEntrypointVideoProc (VPP)
+     * pipeline does the RGBA->NV12 conversion entirely on the GPU (queried
+     * capable of both surface types simultaneously; confirmed via a
+     * standalone probe before writing any of this). [0] = imported RGBA
+     * input (recreated per request, since it wraps a different dma-buf
+     * every time), [1] = recon, [2] = VPP's NV12 output / the encode's
+     * actual source surface (created once per resolution, reused/
+     * overwritten every request -- VPP replaces its content, no need to
+     * destroy and recreate like the imported surface). */
+    VASurfaceID surfaces[3];
+    VAConfigID vpp_config_id;
+    VAContextID vpp_context_id;
     unsigned int width, height;
     int have_context;
 } vaapi_state_t;
@@ -252,6 +265,15 @@ static int vaapi_state_init(vaapi_state_t *st) {
     CHECK_VA(vaCreateConfig(st->dpy, VAProfileH264ConstrainedBaseline, st->entrypoint,
                              &attrib, 1, &st->config_id),
              "vaCreateConfig");
+
+    /* VPP config for the RGBA->NV12 conversion stage (Tier 5.8). No RT
+     * format restriction needed here -- confirmed via a standalone probe
+     * that this driver's VPP surface attributes already list both RGBA-
+     * family and YUV-family pixel formats for VAProfileNone/VideoProc. */
+    CHECK_VA(vaCreateConfig(st->dpy, VAProfileNone, VAEntrypointVideoProc, NULL, 0,
+                             &st->vpp_config_id),
+             "vaCreateConfig(VideoProc)");
+
     st->have_context = 0;
     return 0;
 }
@@ -263,7 +285,9 @@ static int vaapi_state_ensure_resolution(vaapi_state_t *st, unsigned int width, 
     if (st->have_context && st->width == width && st->height == height) return 0;
     if (st->have_context) {
         vaDestroyContext(st->dpy, st->context_id);
+        vaDestroyContext(st->dpy, st->vpp_context_id);
         vaDestroySurfaces(st->dpy, &st->surfaces[1], 1);
+        vaDestroySurfaces(st->dpy, &st->surfaces[2], 1);
         st->have_context = 0;
     }
     CHECK_VA(vaCreateSurfaces(st->dpy, VA_RT_FORMAT_YUV420, width, height,
@@ -272,9 +296,52 @@ static int vaapi_state_ensure_resolution(vaapi_state_t *st, unsigned int width, 
     CHECK_VA(vaCreateContext(st->dpy, st->config_id, width, height, VA_PROGRESSIVE,
                               &st->surfaces[1], 1, &st->context_id),
              "vaCreateContext");
+
+    /* Tier 5.8: the NV12 surface VPP converts into and the encode context
+     * then reads from directly -- allocated internally by the driver
+     * (vaCreateSurfaces with no import attribs), so unlike the RGBA input
+     * there's no gralloc tiling/modifier to worry about here at all. */
+    CHECK_VA(vaCreateSurfaces(st->dpy, VA_RT_FORMAT_YUV420, width, height,
+                               &st->surfaces[2], 1, NULL, 0),
+             "vaCreateSurfaces(vpp-nv12)");
+    CHECK_VA(vaCreateContext(st->dpy, st->vpp_config_id, width, height, VA_PROGRESSIVE,
+                              &st->surfaces[2], 1, &st->vpp_context_id),
+             "vaCreateContext(VideoProc)");
+
     st->width = width;
     st->height = height;
     st->have_context = 1;
+    return 0;
+}
+
+/* Tier 5.8: converts the imported RGBA surface into st->surfaces[2] (NV12)
+ * entirely on the GPU via VA-API's video post-processing pipeline -- the
+ * only VA-API mechanism this driver offers for turning what
+ * GraphicBufferSource actually hands the encoder (RGBA; see DEVLOG for why
+ * getting real YUV out of GraphicBufferSource itself isn't viable on this
+ * Mesa/minigbm stack) into something VCN's encode block can read at all. */
+static int convert_rgba_to_nv12(vaapi_state_t *st, VASurfaceID rgba_surface,
+                                 unsigned int width, unsigned int height) {
+    VARectangle region = {.x = 0, .y = 0, .width = (short)width, .height = (short)height};
+
+    VAProcPipelineParameterBuffer pipeline_param = {0};
+    pipeline_param.surface = rgba_surface;
+    pipeline_param.surface_region = &region;
+    pipeline_param.output_region = &region;
+    pipeline_param.surface_color_standard = VAProcColorStandardNone;
+    pipeline_param.output_color_standard = VAProcColorStandardBT601;
+
+    VABufferID pipeline_buf;
+    CHECK_VA(vaCreateBuffer(st->dpy, st->vpp_context_id, VAProcPipelineParameterBufferType,
+                             sizeof(pipeline_param), 1, &pipeline_param, &pipeline_buf),
+             "vaCreateBuffer(vpp-pipeline)");
+
+    CHECK_VA(vaBeginPicture(st->dpy, st->vpp_context_id, st->surfaces[2]), "vaBeginPicture(vpp)");
+    CHECK_VA(vaRenderPicture(st->dpy, st->vpp_context_id, &pipeline_buf, 1), "vaRenderPicture(vpp)");
+    CHECK_VA(vaEndPicture(st->dpy, st->vpp_context_id), "vaEndPicture(vpp)");
+    CHECK_VA(vaSyncSurface(st->dpy, st->surfaces[2]), "vaSyncSurface(vpp)");
+
+    vaDestroyBuffer(st->dpy, pipeline_buf);
     return 0;
 }
 
@@ -287,17 +354,27 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
 
     /* Tier 5.7 finding: VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME (the old path
      * used up through Tier 5.6) has no way to describe a DRM format
-     * modifier -- it always assumes the buffer is a plain linear NV12
-     * raster. That held for every earlier tier's synthetic/dumb buffers
-     * (which genuinely were linear) but not for a real gralloc-allocated
-     * Surface buffer, which can be GPU-tiled even with DCC compression
-     * disabled (AMD_DEBUG=nodcc only affects compression, not tiling) --
-     * importing a tiled buffer this way produced a garbled, striped decode.
-     * DRM_PRIME_2 (VADRMPRIMESurfaceDescriptor) carries the modifier the
-     * component read out of cros_gralloc's native handle, so the driver
-     * interprets the memory layout correctly regardless of tiling. */
+     * modifier -- it always assumes the buffer is a plain linear raster.
+     * That held for every earlier tier's synthetic/dumb buffers (which
+     * genuinely were linear) but not for a real gralloc-allocated Surface
+     * buffer, which can be GPU-tiled even with DCC compression disabled
+     * (AMD_DEBUG=nodcc only affects compression, not tiling) -- importing a
+     * tiled buffer this way produced a garbled, striped decode. DRM_PRIME_2
+     * (VADRMPRIMESurfaceDescriptor) carries the modifier the component read
+     * out of cros_gralloc's native handle, so the driver interprets the
+     * memory layout correctly regardless of tiling.
+     *
+     * Tier 5.8 finding: the buffer itself is RGBA, not NV12 (Tier 5.7's
+     * closing discovery -- GraphicBufferSource hands the encoder
+     * SurfaceFlinger's raw GL-composited output, and this Mesa/minigbm
+     * stack cannot allocate a buffer that's both GPU-renderable and real
+     * YUV, see DEVLOG). VA_FOURCC_RGBA's byte order matches Android's
+     * RGBA_8888 directly (confirmed back in tier3-dmabuf-import); the DRM
+     * equivalent is DRM_FORMAT_ABGR8888, not DRM_FORMAT_RGBA8888 -- DRM
+     * format names describe *bit* packing in a little-endian 32-bit word,
+     * which inverts to the opposite letter order when read as bytes. */
     VADRMPRIMESurfaceDescriptor prime_desc = {0};
-    prime_desc.fourcc = VA_FOURCC_NV12;
+    prime_desc.fourcc = VA_FOURCC_RGBA;
     prime_desc.width = req->width;
     prime_desc.height = req->height;
     prime_desc.num_objects = 1;
@@ -305,14 +382,11 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
     prime_desc.objects[0].size = req->dmabuf_size;
     prime_desc.objects[0].drm_format_modifier = req->drm_format_modifier;
     prime_desc.num_layers = 1;
-    prime_desc.layers[0].drm_format = DRM_FORMAT_NV12;
-    prime_desc.layers[0].num_planes = 2;
+    prime_desc.layers[0].drm_format = DRM_FORMAT_ABGR8888;
+    prime_desc.layers[0].num_planes = 1;
     prime_desc.layers[0].object_index[0] = 0;
-    prime_desc.layers[0].object_index[1] = 0;
     prime_desc.layers[0].offset[0] = 0;
-    prime_desc.layers[0].offset[1] = req->offset_uv;
     prime_desc.layers[0].pitch[0] = req->stride_y;
-    prime_desc.layers[0].pitch[1] = req->stride_uv;
 
     VASurfaceAttrib import_attribs[2];
     import_attribs[0].type = VASurfaceAttribMemoryType;
@@ -324,10 +398,15 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
     import_attribs[1].value.type = VAGenericValueTypePointer;
     import_attribs[1].value.value.p = &prime_desc;
 
-    VAStatus st_import = vaCreateSurfaces(st->dpy, VA_RT_FORMAT_YUV420, req->width, req->height,
+    VAStatus st_import = vaCreateSurfaces(st->dpy, VA_RT_FORMAT_RGB32, req->width, req->height,
                                            &st->surfaces[0], 1, import_attribs, 2);
     if (st_import != VA_STATUS_SUCCESS) {
         fprintf(stderr, "dma-buf import failed: %s\n", vaErrorStr(st_import));
+        return -1;
+    }
+
+    if (convert_rgba_to_nv12(st, st->surfaces[0], req->width, req->height) != 0) {
+        vaDestroySurfaces(st->dpy, &st->surfaces[0], 1);
         return -1;
     }
 
@@ -406,7 +485,7 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
     submit_packed_header(st->dpy, st->context_id, VAEncPackedHeaderPicture, &pps_bs, &pps_param_buf, &pps_data_buf);
     submit_packed_header(st->dpy, st->context_id, VAEncPackedHeaderSlice, &slice_hdr_bs, &slice_hdr_param_buf, &slice_hdr_data_buf);
 
-    CHECK_VA(vaBeginPicture(st->dpy, st->context_id, st->surfaces[0]), "vaBeginPicture");
+    CHECK_VA(vaBeginPicture(st->dpy, st->context_id, st->surfaces[2]), "vaBeginPicture");
     VABufferID b1[] = {seq_buf};
     vaRenderPicture(st->dpy, st->context_id, b1, 1);
     VABufferID b2[] = {sps_param_buf, sps_data_buf};
@@ -420,7 +499,7 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
     VABufferID b6[] = {slice_buf};
     vaRenderPicture(st->dpy, st->context_id, b6, 1);
     CHECK_VA(vaEndPicture(st->dpy, st->context_id), "vaEndPicture");
-    CHECK_VA(vaSyncSurface(st->dpy, st->surfaces[0]), "vaSyncSurface");
+    CHECK_VA(vaSyncSurface(st->dpy, st->surfaces[2]), "vaSyncSurface");
 
     free(sps_bs.buf);
     free(pps_bs.buf);

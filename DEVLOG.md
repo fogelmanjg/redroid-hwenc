@@ -1279,3 +1279,86 @@ re-walk the same dead end:
 driver (and possibly running into a genuine Mesa/hardware limitation underneath that). Ruled out
 in favor of accepting RGBA and converting it explicitly — either in software or via VA-API's own
 video post-processing (VPP) pipeline, investigation continuing.
+
+## 2026-09-21 (same day) — Tier 5.8: real hardware H.264 encode works end to end for a real app, closing the loop
+
+Between CPU-side conversion and VA-API's own video post-processing (VPP) entrypoint, checked VPP
+first: `vainfo` already showed `VAProfileNone : VAEntrypointVideoProc` on this driver, and a small
+probe (`vaQuerySurfaceAttributes`/`vaQueryVideoProcFilters` against a `VAEntrypointVideoProc`
+config) confirmed its surface attributes list both the RGBA family (input) and the YUV family
+(output) simultaneously in the same context, with format/colorspace conversion being inherent to
+VPP rather than gated behind one of its optional filters (only deinterlacing is listed as a
+filter). Chose VPP over CPU conversion for two reasons: it reuses the modifier-aware `DRM_PRIME_2`
+import Tier 5.7 already built (a CPU path would still need the driver to detile the buffer first
+anyway, since a real Surface-sourced frame can be GPU-tiled), and it keeps every pixel on the GPU,
+never touched by the CPU.
+
+**Implementation** (`tier5-vaapi-daemon/daemon.c`): a second `VAConfigID`/`VAContextID` pair for
+`VAEntrypointVideoProc`, and a third persistent surface (`surfaces[2]`, VA-allocated internally —
+no gralloc tiling/modifier question for this one, the driver owns it end to end) that VPP writes
+NV12 into and the existing encode context then reads from directly, replacing the old "encode
+straight from the imported surface" flow. `encode_one_frame()` now: imports the client's dma-buf as
+RGBA (`VA_FOURCC_RGBA`/`DRM_FORMAT_ABGR8888` — confirmed back in tier3-dmabuf-import that
+`VA_FOURCC_RGBA`'s byte order matches Android's `RGBA_8888` directly; the DRM name is the *opposite*
+letter order because DRM format names describe bit-packing in a little-endian word, not byte
+order), runs one `vaBeginPicture`/`vaRenderPicture(VAProcPipelineParameterBuffer)`/`vaEndPicture`
+pass against the VPP context to convert it, then hands the result to the unchanged encode sequence.
+
+**Validated the new VPP code in isolation before ever touching the real buffer again**: wrote
+`rgba-test-client.c`, a host-side client that allocates a genuinely linear DRM dumb buffer (same
+technique as `tier3-dmabuf-import`), fills it with solid RGBA red via a direct `mmap()` write (the
+daemon never involved in writing it), and sends it through the exact same protocol. Decoded the
+response: `(231, 0, 1)` — correct red, off only by the expected H.264/BT601 quantization loss. This
+isolated the VPP+encode code itself as correct, narrowing the remaining bug specifically to the
+stride/modifier assumptions for the *real* Android buffer.
+
+**Used `adb shell screencap` to see what the real content actually was**, comparing it against the
+corrupted decode from the real pipeline (the first attempt, before the modifier fix below, showed
+a dominant blue background with faint white horizontal noise). Woke the device first
+(`input keyevent KEYCODE_WAKEUP` + `svc power stayon true` — it had gone to sleep, screencap of a
+sleeping display is just black). The real content was the Android setup wizard's "Hi there" screen
+— a blue gradient background with white text and a yellow button. The dominant color matched
+exactly; only fine spatial detail (the text, the button) was destroyed. That specific failure
+mode — correct color, scrambled fine detail — is the signature of GPU-tiled memory read as if it
+were linear raster (a pure stride mistake instead produces diagonal shearing, not this), which
+reopened the modifier question rather than closing it: `AMD_DEBUG=nodcc` only disables
+*compression*, and the buffer is still tiled underneath.
+
+**Determining the real modifier without being able to read it from the buffer.** The buffer's own
+native handle isn't gralloc's `cros_gralloc_handle` at all (confirmed authoritatively via that
+struct's own validation logic, `cros_gralloc_convert_handle()` in `cros_gralloc_helpers.cc`, which
+requires the handle's total allocated size to exactly equal `sizeof(cros_gralloc_handle)`; this
+one is 108 bytes against the 156 required) — some other, unidentified, more generic
+`native_handle_t` this specific pipeline uses instead, with no modifier field to read at all.
+Tried querying the kernel/driver directly a few ways: `amdgpu_bo_query_info()`'s `tiling_info` is
+legacy metadata minigbm's `amdgpu.c` never populates (confirmed: no
+`amdgpu_bo_set_metadata`/`amdgpu_bo_query_info` calls anywhere in that file — this driver stack
+uses the modern per-buffer modifier mechanism exclusively, not that sideband channel), and
+`gbm_bo_get_modifier()` returned `DRM_FORMAT_MOD_INVALID` even via `gbm_bo_create_with_modifiers2`
+with an unconstrained modifier list — this minigbm build's `gbm_bo_get_modifier()` just doesn't
+surface it, tried or not. Solved it by reasoning about the *allocator's own decision process*
+instead of querying the buffer: minigbm's `amdgpu_add_kms_item()` in `amdgpu.c` registers one combo
+per modifier Mesa reports via `dri_query_modifiers()` for a GPU-render-target `ABGR8888` buffer,
+all at the same priority; `drv_get_combination()` (`drv.c`) breaks priority ties by keeping
+whichever combo was registered *first*, so whichever modifier Mesa's query returns first is
+deterministically the one minigbm picks. Queried that same order directly with
+`eglQueryDmaBufModifiersEXT` for `DRM_FORMAT_ABGR8888` on this exact GPU, `AMD_DEBUG=nodcc` set the
+same way `surfaceflinger` has it: four modifiers, all with `DCC=0` in their `AMD_FMT_MOD` bits
+(confirms `nodcc` really does affect this list, not just the encode-time DCC check) — the first,
+`0x0200000000401a01` (`AMD_FMT_MOD_TILE_VER_GFX9`, tile `GFX9_64K_D_X`), is therefore the real one,
+not a guess among the four.
+
+**Confirmed working**: hardcoded that modifier, rebuilt, redeployed, and had the real app re-tested
+against the real pipeline — clean, correctly-colored, correctly-detailed video, confirmed visually.
+Real hardware H.264 encode now runs end to end, from a genuine, unmodified Android app
+(`scrcpy`, via the real `MediaCodec`/`Codec2Client` framework path) capturing real screen content,
+through VA-API/VCN on real AMD hardware, decoded correctly on the other end. This is the actual
+Tier 5 milestone, fully closed — not just "doesn't crash" but the picture is right.
+
+**Known limitation to flag honestly**: the modifier is a hardcoded constant, correct for this
+specific GPU family (GFX9/Renoir) and this specific driver's modifier-ordering behavior today. It
+is not derived from anything portable — a different AMD GPU generation, a Mesa update that
+reorders `dri_query_modifiers()`'s results, or Intel/NVIDIA entirely would need this re-derived the
+same way (query `eglQueryDmaBufModifiersEXT` for the target format/GPU, take the first non-DCC
+entry). Worth eventually replacing with something that determines this at runtime rather than at
+build time, once there's a second GPU target to prove a general mechanism against.
