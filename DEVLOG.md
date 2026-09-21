@@ -1239,3 +1239,43 @@ own RGBA→YUV conversion pass first. Next tier: either find what makes `Graphic
 that conversion (the "correct", standard path real hardware encoders rely on), or accept RGBA and
 convert to NV12 before handing frames to the daemon (VA-API can also take an RGB32 surface
 directly and do the colorspace conversion itself during encode).
+
+## 2026-09-21 (same day) — Ruling out "make Android give us real YUV" before trying it
+
+Before writing any conversion code, checked whether the RGBA-vs-NV12 problem the previous entry
+ended on could be solved for free by getting `GraphicBufferSource` to hand over real YUV instead
+of RGBA — the assumption being that real hardware encoders on real phones receive YUV this way, so
+surely AOSP has a standard mechanism for it. Two findings kill that assumption for this specific
+stack, both worth having on record so a future session (or someone else hitting this) doesn't
+re-walk the same dead end:
+
+1. **No such automatic-conversion code exists in the encoder-input path.** Grepped all of
+   `frameworks/av/media/codec2/` for the color-conversion helpers AOSP does have
+   (`ConvertRGBToPlanarYUV`, `GraphicView2MediaImageConverter` in
+   `sfplugin/Codec2Buffer.cpp`/`sfplugin/utils/Codec2BufferUtils.cpp`) and traced every call site.
+   All four are on the *decoder output* side (`GraphicBlockBuffer`/`ConstGraphicBlockBuffer`,
+   which expose a decoded `C2GraphicBlock` to the app as a `ByteBuffer`/`MediaImage2`). Nothing in
+   this tree automatically converts an encoder's Surface-sourced *input* from RGBA to YUV. The
+   "real encoders just get YUV" behavior on real phones apparently comes from their vendor
+   gralloc/GPU actually being able to allocate and render into a genuine YUV buffer directly, not
+   from a framework-level conversion pass — which is the second finding:
+
+2. **This driver stack cannot allocate a YUV buffer that's also GPU-renderable, full stop.**
+   `external/minigbm/amdgpu.c`'s own format-combination table (`amdgpu_add_combinations`, the code
+   that decides what pixel format + tiling a given usage-bit combination is allowed to produce)
+   registers `DRM_FORMAT_NV12` as `TILE_TYPE_LINEAR` only for the combination
+   `BO_USE_CAMERA_READ | BO_USE_CAMERA_WRITE | BO_USE_SCANOUT | BO_USE_HW_VIDEO_DECODER |
+   BO_USE_HW_VIDEO_ENCODER | BO_USE_PROTECTED` — notably *without* any GPU-rendering usage bit
+   (`BO_USE_RENDERING`/texture usage) in that set. Our buffer needs both at once (SurfaceFlinger's
+   GL compositor draws into it *and* our encoder reads it), so no registered combination matches,
+   and `cros_gralloc_driver::get_resolved_format_and_use_flags()` falls back to an RGBA render
+   target — independent of anything our C2 interface declares. This isn't a config mistake on our
+   side to fix; it's this desktop Mesa/radeonsi driver stack (built for GPUs that never need to
+   render straight to a YUV target, unlike a real mobile SoC's GPU+display pipeline) not having
+   that capability registered at all — and it's unclear it's even physically possible on this
+   hardware, not just unregistered.
+
+**Conclusion**: "get real YUV for free" is not a live option here without patching minigbm's own
+driver (and possibly running into a genuine Mesa/hardware limitation underneath that). Ruled out
+in favor of accepting RGBA and converting it explicitly — either in software or via VA-API's own
+video post-processing (VPP) pipeline, investigation continuing.
