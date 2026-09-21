@@ -32,6 +32,11 @@
 #include <va/va_vpp.h>
 #include <drm/drm_fourcc.h>
 
+#include <gbm.h>
+#define EGL_EGLEXT_PROTOTYPES
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+
 #include "protocol.h"
 
 #define DRM_RENDER_DEVICE "/dev/dri/renderD128"
@@ -221,7 +226,69 @@ typedef struct {
     VAContextID vpp_context_id;
     unsigned int width, height;
     int have_context;
+    /* Tier 5.9: the real DRM format modifier a GPU-render-target RGBA
+     * buffer ends up with is GPU-generation-specific (confirmed: differs
+     * between a Renoir/GFX9 APU and a Polaris/GFX8 discrete card) and can't
+     * be read off the buffer itself on this Android build (see DEVLOG) --
+     * determined once at startup instead, per host GPU, so a new machine
+     * only ever needs this daemon rebuilt (a local `gcc`, seconds) and never
+     * the Android-side component (an AOSP rebuild, tied to a single build
+     * host). See rgba_modifier_init() for how. */
+    uint64_t rgba_modifier;
 } vaapi_state_t;
+
+/* Tier 5.9: reproduces minigbm's own tie-break for which tiling a
+ * GPU-render-target RGBA buffer gets (amdgpu.c's amdgpu_add_kms_item():
+ * one combination per modifier Mesa reports via dri_query_modifiers(), all
+ * at equal priority; drv.c's drv_get_combination() keeps whichever combo
+ * was registered *first* on a priority tie) -- by asking Mesa for that same
+ * ordering directly via EGL and taking its first answer, instead of relying
+ * on a value hardcoded for one specific GPU generation.
+ *
+ * Needs AMD_DEBUG=nodcc set (main() does this, before any Mesa entry point
+ * runs -- Mesa parses its debug env vars once per process and caches them,
+ * so setenv() here would be too late: confirmed the hard way, calling it at
+ * the top of this function still queried under the process's original
+ * environment). surfaceflinger gets the same env var exported to it at
+ * boot (see redroid-nodcc.rc) so the real buffer's allocation never picks
+ * a DCC-compressed tiling at all (VCN can't encode from those, confirmed
+ * in Tier 5.7) -- without nodcc here too, this queries 8 modifiers instead
+ * of 4 and the first one has DCC=1: a decision the real allocation was
+ * never actually given the chance to make. */
+static uint64_t rgba_modifier_init(int drm_fd) {
+    uint64_t fallback = DRM_FORMAT_MOD_LINEAR;
+    struct gbm_device *gbm = gbm_create_device(drm_fd);
+    if (!gbm) {
+        fprintf(stderr, "rgba_modifier_init: gbm_create_device failed, assuming LINEAR\n");
+        return fallback;
+    }
+    EGLDisplay dpy = eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, gbm, NULL);
+    EGLint major, minor;
+    if (dpy == EGL_NO_DISPLAY || !eglInitialize(dpy, &major, &minor)) {
+        fprintf(stderr, "rgba_modifier_init: eglInitialize failed, assuming LINEAR\n");
+        gbm_device_destroy(gbm);
+        return fallback;
+    }
+    PFNEGLQUERYDMABUFMODIFIERSEXTPROC queryMods =
+        (PFNEGLQUERYDMABUFMODIFIERSEXTPROC)eglGetProcAddress("eglQueryDmaBufModifiersEXT");
+    EGLint num_mods = 0;
+    if (!queryMods || !queryMods(dpy, DRM_FORMAT_ABGR8888, 0, NULL, NULL, &num_mods) ||
+        num_mods == 0) {
+        fprintf(stderr, "rgba_modifier_init: no modifiers reported, assuming LINEAR\n");
+        gbm_device_destroy(gbm);
+        return fallback;
+    }
+    EGLuint64KHR *mods = malloc(num_mods * sizeof(EGLuint64KHR));
+    EGLBoolean *external = malloc(num_mods * sizeof(EGLBoolean));
+    queryMods(dpy, DRM_FORMAT_ABGR8888, num_mods, mods, external, &num_mods);
+    uint64_t chosen = mods[0];
+    fprintf(stderr, "rgba_modifier_init: %d modifiers for ABGR8888, using first: 0x%016llx\n",
+            num_mods, (unsigned long long)chosen);
+    free(mods);
+    free(external);
+    gbm_device_destroy(gbm);
+    return chosen;
+}
 
 static int vaapi_state_init(vaapi_state_t *st) {
     memset(st, 0, sizeof(*st));
@@ -239,6 +306,8 @@ static int vaapi_state_init(vaapi_state_t *st) {
     CHECK_VA(vaInitialize(st->dpy, &major, &minor), "vaInitialize");
     fprintf(stderr, "VA-API %d.%d, driver: %s\n", major, minor,
             vaQueryVendorString(st->dpy));
+
+    st->rgba_modifier = rgba_modifier_init(st->drm_fd);
 
     int num_entrypoints = vaMaxNumEntrypoints(st->dpy);
     VAEntrypoint *entrypoints = malloc(num_entrypoints * sizeof(VAEntrypoint));
@@ -372,7 +441,15 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
      * RGBA_8888 directly (confirmed back in tier3-dmabuf-import); the DRM
      * equivalent is DRM_FORMAT_ABGR8888, not DRM_FORMAT_RGBA8888 -- DRM
      * format names describe *bit* packing in a little-endian 32-bit word,
-     * which inverts to the opposite letter order when read as bytes. */
+     * which inverts to the opposite letter order when read as bytes.
+     *
+     * Tier 5.9: the modifier comes from st->rgba_modifier (this host's own
+     * GPU, determined once at daemon startup), not from the client's
+     * request -- the Android-side component has no reliable way to read
+     * its real value at all (see DEVLOG), and the value is GPU-generation-
+     * specific besides, so asking this host's own driver directly is both
+     * the only correct source and the one that needs no Android rebuild to
+     * change machines. req->drm_format_modifier is intentionally ignored. */
     VADRMPRIMESurfaceDescriptor prime_desc = {0};
     prime_desc.fourcc = VA_FOURCC_RGBA;
     prime_desc.width = req->width;
@@ -380,7 +457,7 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
     prime_desc.num_objects = 1;
     prime_desc.objects[0].fd = dmabuf_fd;
     prime_desc.objects[0].size = req->dmabuf_size;
-    prime_desc.objects[0].drm_format_modifier = req->drm_format_modifier;
+    prime_desc.objects[0].drm_format_modifier = st->rgba_modifier;
     prime_desc.num_layers = 1;
     prime_desc.layers[0].drm_format = DRM_FORMAT_ABGR8888;
     prime_desc.layers[0].num_planes = 1;
@@ -588,6 +665,10 @@ static void handle_connection(vaapi_state_t *st, int conn_fd) {
 
 int main(void) {
     setvbuf(stderr, NULL, _IONBF, 0);
+
+    /* Must happen before any Mesa entry point runs at all (vaInitialize
+     * included) -- see rgba_modifier_init()'s comment for why. */
+    setenv("AMD_DEBUG", "nodcc", 1);
 
     vaapi_state_t st;
     if (vaapi_state_init(&st) != 0) return 1;

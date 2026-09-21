@@ -1362,3 +1362,43 @@ reorders `dri_query_modifiers()`'s results, or Intel/NVIDIA entirely would need 
 same way (query `eglQueryDmaBufModifiersEXT` for the target format/GPU, take the first non-DCC
 entry). Worth eventually replacing with something that determines this at runtime rather than at
 build time, once there's a second GPU target to prove a general mechanism against.
+
+## 2026-09-21 (same day) — Tier 5.9: the daemon determines its own GPU's modifier instead of hardcoding it
+
+That "second GPU target" showed up immediately: extending to a machine with a discrete AMD card
+(Polaris/GFX8, a completely different tiling generation from server01's Renoir/GFX9) made the
+hardcoded-modifier limitation from the previous entry a real, immediate problem rather than a
+someday one — and pointed at a real architecture mistake worth fixing before copying anything:
+the modifier had been hardcoded into `VaapiEncComponent.cpp`, the *Android-side* component, which
+only builds inside the one AOSP tree on server01. Every new host GPU would have needed a
+cross-machine AOSP rebuild just to change one constant, even though the value is purely a host-GPU
+fact the *daemon* (which already runs once per host, already talks to that host's GPU directly)
+is in a much better position to know.
+
+Moved the whole determination into `daemon.c` instead: `rgba_modifier_init()`, called once at
+daemon startup, opens the render node via GBM, gets an EGL display from it, and calls
+`eglQueryDmaBufModifiersEXT` for `DRM_FORMAT_ABGR8888` — the same technique the previous entry
+used from a throwaway probe, now permanent code. `VaapiEncComponent.cpp` now just sends 0 for
+`drm_format_modifier`, and the daemon ignores whatever it's sent, using its own
+`st->rgba_modifier` instead. Net effect: a new host GPU now only ever needs this daemon
+recompiled locally (plain `gcc`, no AOSP, seconds not tens of minutes) — the Android-side vendor
+image is unchanged and identical across every machine.
+
+**Two real bugs surfaced getting this right, both about *when* the query runs relative to when
+Mesa reads `AMD_DEBUG`:**
+1. First version called `eglQueryDmaBufModifiersEXT` without setting `AMD_DEBUG=nodcc` for the
+   daemon's own process at all. Server01 abruptly reported *8* modifiers instead of the expected
+   4-5, and the first one decoded to `DCC=1` — because nothing here disables DCC for the daemon's
+   own queries, only `surfaceflinger` (inside the Android container) has that env var exported to
+   it. Querying without it answers a different question than "what modifier will the real buffer
+   actually have" (the real buffer's allocator, minigbm inside Android, *does* have nodcc active).
+2. Fixed that by calling `setenv("AMD_DEBUG", "nodcc", 1)` right before the query — and got the
+   *same* wrong 8-modifier, `DCC=1` answer again. Mesa parses its debug env vars once per process
+   and caches the result (a `static` guard inside its debug-string parsing, shared across every
+   Mesa entry point in that process, not per-driver-instance) — by the time `rgba_modifier_init()`
+   ran, `vaInitialize()` had already loaded the VA-API driver and Mesa had already read (and
+   cached) the process's original environment. Moved the `setenv()` call to the very first line of
+   `main()`, before *any* Mesa/VA-API/EGL call — confirmed fixed: back to 5 modifiers, first one
+   `0x0200000000401a01`, matching the value hand-derived and hardcoded in the previous entry
+   exactly. Re-tested against the real pipeline end to end on server01 afterward to confirm the
+   refactor changed nothing observable — same correct picture as before.

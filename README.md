@@ -112,8 +112,12 @@ encoder: AMD VCN's DCC-compression restriction on real GPU-tiled buffers, a GPU-
 conversion stage using VA-API's own video post-processing (VPP) entrypoint (validated correct in
 isolation with a known-color synthetic buffer before ever touching the real one again), and
 determining the buffer's real (and un-queryable) GPU tiling modifier by reasoning through
-minigbm's own allocator decision logic rather than guessing. See [DEVLOG.md](DEVLOG.md) for the
-real progress, session by session.
+minigbm's own allocator decision logic rather than guessing. That modifier turned out to be
+GPU-generation-specific (confirmed extending to a second, different AMD GPU), so it now lives in
+the host-side daemon (determined once at startup by asking that host's own driver directly) rather
+than hardcoded into the Android-side component — a new host GPU only needs this small daemon
+recompiled locally, never a cross-machine AOSP rebuild. See [DEVLOG.md](DEVLOG.md) for the real
+progress, session by session.
 
 ## Contributing
 

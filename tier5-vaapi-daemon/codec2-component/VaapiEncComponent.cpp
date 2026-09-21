@@ -236,26 +236,24 @@ void VaapiEncComponent::process(const std::unique_ptr<C2Work> &work,
     // color-format = 2130708361): this Mesa/minigbm stack can't allocate a
     // buffer that's both GPU-renderable and real YUV at once (see DEVLOG),
     // so GraphicBufferSource hands over SurfaceFlinger's raw GL-composited
-    // RGBA output instead. drm_format_modifier is left at 0 (LINEAR) since
-    // this handle format has no identifiable modifier field at all, so the
-    // real modifier can't be read from it. Determined it a different way
-    // instead: minigbm's amdgpu.c registers one combination per modifier
-    // Mesa reports via dri_query_modifiers() for a GPU-render-target ABGR
-    // buffer, all sharing the same priority -- drv_get_combination() (in
-    // drv.c) breaks priority ties by taking the FIRST-registered match, so
-    // whichever modifier Mesa returns first for this format/GPU is the one
-    // that wins. Queried Mesa directly for that order (eglQueryDmaBufModifiersEXT
-    // for DRM_FORMAT_ABGR8888 on this exact GPU, with AMD_DEBUG=nodcc set the
-    // same way surfaceflinger has it): 4 modifiers, all DCC=0 (confirms nodcc
-    // affects this list, not just the encode-time DCC check), first one
-    // 0x0200000000401a01 (AMD_FMT_MOD_TILE_VER_GFX9, tile=GFX9_64K_D_X).
+    // RGBA output instead.
+    //
+    // Tier 5.9: drm_format_modifier is sent as 0 and ignored by the daemon
+    // on purpose. This handle format has no identifiable modifier field to
+    // read, and the real value is GPU-generation-specific besides (differs
+    // even between two AMD GPUs); the daemon determines its own host's real
+    // modifier once at startup by querying that host's own driver directly
+    // (see rgba_modifier_init() in daemon.c) instead of trusting anything
+    // this side could say. That also means a new host GPU only ever needs
+    // this daemon recompiled locally (plain gcc, no AOSP) -- never this
+    // component rebuilt, which needs the one machine with the AOSP tree.
     int dmabufFd = handle->data[0];
     const int32_t *ints = &handle->data[handle->numFds];
     uint32_t width = (uint32_t)ints[2];
     uint32_t height = (uint32_t)ints[3];
     uint32_t strideY = (uint32_t)ints[6];
     uint32_t dmabufSize = strideY * height;
-    uint64_t drmFormatModifier = 0x0200000000401a01ULL; /* GFX9_64K_D_X, DCC=0 */
+    uint64_t drmFormatModifier = 0; /* ignored by the daemon, see above */
 
     unsigned char *coded = nullptr;
     long codedSize = encodeViaDaemon(dmabufFd, width, height, strideY, /*strideUv=*/0,
