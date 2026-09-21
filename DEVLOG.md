@@ -1029,3 +1029,82 @@ from a real Android-allocated dma-buf this time, obtained the correct way.
 
 Next: 5.5, wiring this client logic into `tier4-codec2-skeleton`'s `createComponent()` for a real
 Codec2 component.
+
+## 2026-09-21 — Tier 5.5: a real C2Component processes real work and produces correct H.264
+
+Closed 5.5: c2.hardware.encoder.h264 went from "registered and listed" (Tier 4) to "actually
+processes a real C2Work item through the genuine Codec2 framework machinery and returns correct,
+decodable H.264" (Tier 5.5) -- the literal "wire Tier 2/3 into the callbacks of the Tier 4
+component" goal from the original roadmap.
+
+**Picked SimpleC2Component over reusing v4l2_codec2's EncodeComponent verbatim.** The original
+Tier 1 plan assumed porting `external/v4l2_codec2/components/EncodeComponent.cpp` (1078 lines)
+wholesale, swapping only its `VideoEncoder` backend. Looked at it seriously this session and found
+two real reasons not to: its `VideoEncoder` interface is built around V4L2's async,
+interrupt-driven hardware model (`base::Callback`-based `InputBufferDoneCB`/`OutputBufferDoneCB`),
+which doesn't fit our daemon's simple synchronous request/response round trip at all; and even the
+*reference* project doesn't show a complete example wiring `EncodeComponent` + a concrete
+`VideoEncoder` + `ComponentStore` together (no `V4L2Encoder::create()` callers anywhere in this
+tree) -- meaning "verbatim reuse" wasn't actually a complete, working example to copy from either.
+
+Found a much better fit in `frameworks/av/media/codec2/components/base/`:
+`SimpleC2Component` (used by all of AOSP's own software codecs, e.g. the exact
+`c2.android.avc.encoder` Tier 0's fix unlocked) exposes a single synchronous
+`process(work, pool)` you override, plus five trivial lifecycle hooks
+(`onInit`/`onStop`/`onReset`/`onRelease`/`onFlush_sm`) -- it handles the entire `C2Component`
+contract (`queue_nb`, threading, work ordering) internally. Paired with
+`SimpleC2Interface<T>::BaseParams` (wraps any `C2InterfaceHelper` -- exactly the pattern Tier 4's
+`StoreImpl::Interface` already used -- into a full `C2ComponentInterface`), this let the whole
+component come together as ~250 lines instead of needing v4l2_codec2's much larger dependency
+closure (`libchrome`, its own `VideoFramePool`, `FormatConverter`, etc.).
+
+**`external/vaapi_codec2/component/VaapiEncComponent.{h,cpp}`**: `VaapiEncInterface` (a
+`PictureSize` param, default 320x240, on top of `BaseParams`' standard identity/media-type
+plumbing) and `VaapiEncComponent : public SimpleC2Component`. `process()` extracts the input
+`C2GraphicBlock`'s dma-buf fd via `block.handle()->data[0]` -- the *exact* pattern
+`external/v4l2_codec2`'s own `createInputFrame()` uses (confirmed by reading it this session,
+Tier 1's citation held up) -- deliberately skipping `block.map()`/`layout()` entirely, since
+Tier 5.4 already proved this build's Mapper HAL doesn't implement the flexible-layout verb that
+needs (ENOSYS). Sends the fd to the daemon over the same socket protocol as every 5.2-5.4 client,
+gets back H.264 bytes, and writes them into a `C2LinearBlock` fetched from the framework's own
+`pool` via `createLinearBuffer()` -- a protected helper `SimpleC2Component` itself provides (found
+by reading `C2SoftAvcEnc.cpp`'s own `finishWork()`), so no buffer-wrapping code needed writing.
+
+**`service.cpp`'s `StoreImpl::createComponent()`/`createInterface()`** now construct real
+`VaapiEncComponent`/`VaapiEncInterface` instances for `"c2.hardware.encoder.h264"` instead of
+returning `C2_NOT_FOUND`.
+
+**Two real Soong linkage lessons, both non-obvious:**
+1. A `cc_library_static`'s own `shared_libs` don't automatically make their *headers* available to
+   whatever links against that static library -- needed an explicit
+   `export_shared_lib_headers: ["libcodec2_soft_common"]` on `libvaapi_codec2_component`, or
+   `service.cpp` couldn't find `<SimpleC2Component.h>` at all (`fatal error: file not found`)
+   despite the static lib compiling fine on its own.
+2. Even with headers fixed, the actual *symbols* from `libcodec2_soft_common.so` and
+   `libstagefright_foundation.so` (for `MEDIA_MIMETYPE_VIDEO_AVC`) didn't make it onto the final
+   binary's link line either -- Soong didn't propagate them transitively through the static-lib
+   dependency in this build config. Fixed by listing both directly in the *binary's own*
+   `shared_libs` (`service/Android.bp`), not just the static library's.
+
+**Test harness, not a hand-rolled shortcut**: `component_test.cpp` drives `VaapiEncComponent`
+directly (bypassing the AIDL layer, which Tier 4 already confirmed separately) with a **real**
+`C2Work` wrapping a **real** `C2GraphicBlock` -- built via
+`_C2BlockFactory::CreateGraphicBlock(AHardwareBuffer*)`, a genuine AOSP API for wrapping an
+app-provided `AHardwareBuffer` into Codec2, the same mechanism real Surface-based encoder input
+eventually goes through. Sets a `Listener`, calls `start()` → `setListener_vb()` → `queue_nb()`,
+waits on a condition variable for `onWorkDone_nb()`, and reads the output linear block directly.
+
+**Confirmed working, deployed on a real redroid instance** (diffed two new libraries pulled in by
+this change, `libcodec2_soft_common.so`/`libsfplugin_ccodec_utils.so`, into the usual
+create-inject-start-once cycle; `libstagefright_foundation.so` turned out already present in the
+base image): `queue_nb()` → `process()` → the daemon round trip → `onWorkDone_nb()` produced 83
+bytes of valid H.264 (`ffprobe`/`ffmpeg` confirm: H.264, Constrained Baseline, 320x240, decodes
+clean). Different byte count than every prior tier's 69/70 bytes is expected and correct here --
+this test didn't fill the gralloc buffer with the usual flat-128 pattern before wrapping it, so
+the encoder genuinely compressed whatever uninitialized content was actually in that fresh
+allocation, not a controlled test pattern.
+
+**What's left for Tier 5.6**: a real app (or `screenrecord`) driving this component through the
+actual framework (`MediaCodec`/`Codec2Client`, not a hand-built `C2Work`), which will be the first
+real test of the fixed 512-byte stride assumption against a genuinely externally-produced buffer
+whose actual layout this component doesn't control.

@@ -25,10 +25,19 @@ cc_binary {
         "service.cpp",
     ],
 
+    static_libs: [
+        "libvaapi_codec2_component",
+    ],
+
     shared_libs: [
         "libavservices_minijail",
         "libbinder",
         "libbinder_ndk",
+        // Not propagated transitively from libvaapi_codec2_component's own
+        // shared_libs (Soong didn't pull these onto this binary's link line
+        // automatically) -- listed explicitly here instead.
+        "libcodec2_soft_common",
+        "libstagefright_foundation",
     ],
     required: ["android.hardware.media.c2-vaapi-seccomp_policy"],
 

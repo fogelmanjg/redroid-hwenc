@@ -97,11 +97,11 @@ GPUs (AMD APU, AMD discrete, Intel iGPU) with a synthetic buffer, then confirmed
 real, live dma-buf pulled out of a running redroid container's own gralloc-backed process; and a
 real Codec2 hardware component (`c2.hardware.encoder.h264`) now registers and lists correctly on
 a live redroid instance. Tier 5 is in progress: a host-side daemon reusing Tier 2/3's encode
-pipeline unchanged (avoiding a much bigger Mesa/LLVM-for-bionic port) is confirmed working,
-byte-identical to Tier 2's own reference output — including from a test binary actually running
-inside Android, talking to the daemon over a Unix socket bridge. Next: the same round trip with a
-real Android gralloc buffer, then wiring it into the Tier 4 component's callbacks. See
-[DEVLOG.md](DEVLOG.md) for the real progress, session by session.
+pipeline unchanged (avoiding a much bigger Mesa/LLVM-for-bionic port) is wired all the way into
+the Tier 4 component — a real `C2Work` wrapping a real Android gralloc buffer, driven through the
+genuine `queue_nb()`/`process()`/`onWorkDone_nb()` framework machinery, produces valid, decodable
+H.264. Next: the same test driven by a real app (or `screenrecord`) via `MediaCodec` instead of a
+hand-built `C2Work`. See [DEVLOG.md](DEVLOG.md) for the real progress, session by session.
 
 ## Contributing
 

@@ -1,0 +1,68 @@
+// Tier 5.5: the real C2Component wiring the VA-API encode daemon into
+// c2.hardware.encoder.h264's process() callback.
+
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+cc_library_static {
+    name: "libvaapi_codec2_component",
+    vendor: true,
+
+    srcs: [
+        "VaapiEncComponent.cpp",
+    ],
+
+    export_include_dirs: ["."],
+
+    shared_libs: [
+        "libcodec2_soft_common",
+        "libcodec2",
+        "libcodec2_vndk",
+        "libcutils",
+        "liblog",
+        "libstagefright_foundation",
+    ],
+    export_shared_lib_headers: [
+        "libcodec2_soft_common",
+    ],
+
+    cflags: [
+        "-Wall",
+        "-Wno-unused-parameter",
+    ],
+}
+
+// Tier 5.5 checkpoint: drives the component directly with a real work item,
+// see component_test.cpp for why this isn't a hand-rolled shortcut.
+cc_binary {
+    name: "vaapi_component_test",
+    vendor: true,
+
+    srcs: [
+        "component_test.cpp",
+    ],
+
+    static_libs: [
+        "libvaapi_codec2_component",
+    ],
+
+    shared_libs: [
+        "libcodec2",
+        "libcodec2_vndk",
+        "libcodec2_soft_common",
+        "libstagefright_foundation",
+        "liblog",
+        "libnativewindow",
+        "libcutils",
+    ],
+
+    header_libs: [
+        "libcodec2_internal",
+    ],
+
+    cflags: [
+        "-Wall",
+        "-Wno-unused-parameter",
+    ],
+}

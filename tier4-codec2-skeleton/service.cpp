@@ -15,24 +15,21 @@
  */
 
 /*
- * Tier 4: minimal Codec2 IComponentStore that Android recognizes and lists a
- * hardware encoder in (`dumpsys media.c2` / `IComponentStore::listComponents`)
- * -- without any real encoding wired in yet (that's Tier 5, where the VA-API
- * encode logic already proven in tier2-vaapi-encode/tier3-dmabuf-import gets
- * wired into createComponent()).
+ * Tier 4 registered c2.hardware.encoder.h264 (dumpsys media.c2 /
+ * IComponentStore::listComponents) without any real encoding wired in.
+ * Tier 5.5 wires it up for real: createComponent()/createInterface() now
+ * construct a VaapiEncComponent, whose process() calls the host-side
+ * VA-API encode daemon (tier5-vaapi-daemon, proven end to end against a
+ * real Android gralloc buffer in Tier 5.4) instead of returning
+ * C2_NOT_FOUND.
  *
  * Adapted from AOSP's official empty-service template at
  * frameworks/av/media/codec2/hal/services/vendor.cpp (its own header says:
  * "make a copy of this whole directory and rename modules accordingly" --
- * this is that copy). Two changes from the template:
- *   - HIDL path removed entirely. Tier 0 already confirmed this specific
- *     redroid build only wires up the software Codec2 store when
- *     media.c2.hal.selection=aidl (IsCodec2AidlHalSelected() gates on it) --
- *     the HIDL fallback in the generic template doesn't apply here.
- *   - listComponents() reports one component, c2.hardware.encoder.h264,
- *     instead of the template's empty list. createComponent()/
- *     createInterface() still return C2_NOT_FOUND for it -- Tier 4's whole
- *     point is registration/enumeration, not a working encoder yet.
+ * this is that copy). HIDL path removed entirely: Tier 0 already confirmed
+ * this specific redroid build only wires up a Codec2 store when
+ * media.c2.hal.selection=aidl (IsCodec2AidlHalSelected() gates on it) --
+ * the generic template's HIDL fallback doesn't apply here.
  */
 
 //#define LOG_NDEBUG 0
@@ -49,6 +46,8 @@
 #include <android/binder_process.h>
 #include <codec2/aidl/ComponentStore.h>
 #include <codec2/aidl/ParamTypes.h>
+
+#include "VaapiEncComponent.h"
 
 // This is the absolute on-device path of the prebuilt_etc module
 // "android.hardware.media.c2-vaapi-seccomp_policy" in Android.bp.
@@ -80,17 +79,27 @@ public:
     }
 
     virtual c2_status_t createComponent(
-            C2String /*name*/,
-            std::shared_ptr<C2Component>* const /*component*/) override {
-        // Tier 5: wire the tier2-vaapi-encode / tier3-dmabuf-import pipeline
-        // in here once c2.hardware.encoder.h264 needs to actually encode.
-        return C2_NOT_FOUND;
+            C2String name,
+            std::shared_ptr<C2Component>* const component) override {
+        if (name != "c2.hardware.encoder.h264") {
+            return C2_NOT_FOUND;
+        }
+        auto intf = std::make_shared<android::VaapiEncInterface>(mReflectorHelper);
+        *component = std::make_shared<android::VaapiEncComponent>(name.c_str(), mNextId++, intf);
+        return C2_OK;
     }
 
     virtual c2_status_t createInterface(
-            C2String /* name */,
-            std::shared_ptr<C2ComponentInterface>* const /* interface */) override {
-        return C2_NOT_FOUND;
+            C2String name,
+            std::shared_ptr<C2ComponentInterface>* const interface) override {
+        if (name != "c2.hardware.encoder.h264") {
+            return C2_NOT_FOUND;
+        }
+        auto intf = std::make_shared<android::VaapiEncInterface>(mReflectorHelper);
+        *interface = std::make_shared<
+                android::SimpleInterface<android::VaapiEncInterface>>(
+                name.c_str(), mNextId++, intf);
+        return C2_OK;
     }
 
     virtual std::vector<std::shared_ptr<const C2Component::Traits>>
@@ -193,6 +202,7 @@ private:
     };
     std::shared_ptr<C2ReflectorHelper> mReflectorHelper;
     Interface mInterface;
+    c2_node_id_t mNextId = 0;
 };
 
 int main(int /* argc */, char** /* argv */) {

@@ -81,7 +81,31 @@ alignment requirement, not the buffer's origin), fixed by filling/describing the
 aligned stride instead. Result: another **69 bytes, byte-for-byte identical to Tier 2's reference
 output**, this time encoded from a real Android-allocated gralloc buffer.
 
+## 5.5: a real C2Component, driven through the genuine framework machinery
+
+`codec2-component/VaapiEncComponent.{h,cpp}` is a real `C2Component` built on
+`SimpleC2Component` (the same base class AOSP's own software codecs use, e.g. the stock
+`c2.android.avc.encoder` Tier 0's fix unlocked) rather than porting `external/v4l2_codec2`'s much
+larger `EncodeComponent` verbatim — that reference's `VideoEncoder` interface is built for V4L2's
+async, interrupt-driven model, which doesn't fit this daemon's simple synchronous round trip, and
+even the reference project itself has no complete example wiring it end to end. `process()`
+extracts the input `C2GraphicBlock`'s dma-buf fd via `block.handle()->data[0]` (the same pattern
+`v4l2_codec2`'s own `createInputFrame()` uses), sends it to the daemon, and writes the H.264 bytes
+back via `createLinearBuffer()` — a helper `SimpleC2Component` already provides. `service.cpp`'s
+`createComponent()`/`createInterface()` now construct real instances of this instead of returning
+`C2_NOT_FOUND`.
+
+`codec2-component/component_test.cpp` drives it with a **real** `C2Work` wrapping a **real**
+`C2GraphicBlock` — built via `_C2BlockFactory::CreateGraphicBlock(AHardwareBuffer*)`, a genuine
+AOSP API for wrapping an app-provided `AHardwareBuffer` into Codec2 (the same mechanism real
+Surface-based encoder input eventually goes through) — through the actual
+`queue_nb()`/`process()`/`onWorkDone_nb()` machinery, not a hand-rolled shortcut. Result: **83
+bytes of valid, decodable H.264** (a different byte count than every other tier's 69/70 is
+expected here — this test didn't fill the buffer with the usual flat-128 pattern, so it's
+compressing real uninitialized memory content instead of a known test pattern).
+
 ## What's next
 
-- **5.5**: wire this client logic into `tier4-codec2-skeleton`'s `createComponent()` for a real
-  Codec2 component, not just a standalone test binary.
+- **5.6**: a real app (or `screenrecord`) driving this component through `MediaCodec`/
+  `Codec2Client` instead of a hand-built `C2Work` — the first test of the fixed 512-byte stride
+  assumption against a genuinely externally-produced buffer.
