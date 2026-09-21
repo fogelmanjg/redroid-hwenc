@@ -1402,3 +1402,40 @@ Mesa reads `AMD_DEBUG`:**
    `0x0200000000401a01`, matching the value hand-derived and hardcoded in the previous entry
    exactly. Re-tested against the real pipeline end to end on server01 afterward to confirm the
    refactor changed nothing observable — same correct picture as before.
+
+## 2026-09-21 (same day) — Second GPU generation (Polaris/GFX8) hits a genuinely different wall
+
+Set up the exact same test rig on `jgustavo46` (AMD Radeon RX 480, Polaris10 — GFX8, a full
+generation older than server01's Renoir/GFX9, and notably *not* in the `AMD_FMT_MOD_TILE_VER_*`
+list at all, which only starts at GFX9) using the *same, unmodified* vendor image built on
+server01 — confirming the whole point of the Tier 5.9 refactor: no AOSP rebuild needed, just the
+daemon recompiled locally (`gcc`, plain apt packages for `libegl-dev`/`libgbm-dev`).
+
+Validated the daemon itself first with `rgba-test-client.c`, same as always: solid red in, correct
+red out (`231,0,1`). Real pipeline: `dma-buf import failed: resource allocation failed`. Before
+assuming the stride/geometry reading was wrong (this GPU's real buffer reports a 3072-byte stride,
+768px-wide-equivalent — different alignment than server01's 2560), ran a controlled test instead
+of guessing: allocated a genuinely-linear DRM dumb buffer at the *exact same* stride (over-allocate
+a 768px-wide buffer, same trick as always, so the kernel hands back real linear memory at stride
+3072) and sent that through. It imported and encoded fine. That isolates the failure to the real
+buffer specifically — the stride value itself isn't the problem, so the real buffer genuinely
+isn't linear.
+
+But `eglQueryDmaBufModifiersEXT` for `DRM_FORMAT_ABGR8888` on this exact GPU reports **zero**
+modifiers (confirmed both with and without `AMD_DEBUG=nodcc` — makes no difference here). Reading
+`amdgpu_add_kms_item()` in minigbm's `amdgpu.c` again with this in mind: when
+`dri_query_modifiers()` returns no modifiers for a format, minigbm doesn't fall back to LINEAR —
+it falls into the *other* branch, registering the format as `TILE_TYPE_DRI`: an opaque tiling
+Mesa's own DRI driver manages internally and never exposes as an exportable DRM modifier at all.
+`VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2` fundamentally cannot describe a buffer like this — there
+is no modifier value to give it, because the tiling isn't modifier-based to begin with. This is a
+different problem from anything Tier 5.7-5.9 solved, not a variant of the same one.
+
+**Stopping here for this session** (documented rather than chased further): the likely fix is a
+different import mechanism entirely for this class of GPU — going through Mesa's own DRI/EGL image
+APIs (`eglCreateImageKHR`/`EGL_LINUX_DMA_BUF_EXT` without a modifier, letting Mesa's own driver
+resolve its private tiling internally, the way a GL/EGL consumer normally would) instead of
+VA-API's direct PRIME import, which needs the modifier spelled out. Not yet investigated. Added a
+hardware compatibility table to the README to track this kind of per-GPU finding going forward, as
+this project starts touching genuinely different hardware generations rather than just different
+vendors.

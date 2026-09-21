@@ -119,6 +119,24 @@ than hardcoded into the Android-side component — a new host GPU only needs thi
 recompiled locally, never a cross-machine AOSP rebuild. See [DEVLOG.md](DEVLOG.md) for the real
 progress, session by session.
 
+## Hardware compatibility
+
+Real results on real hardware, not speculation. "Tier 5" here means the full stack: a real,
+unmodified app records correct video through the genuine Android framework path. "Tier 3 only"
+means the underlying import+encode mechanism was proven on that GPU with a synthetic buffer, but
+the full real-app pipeline hasn't been (or can't yet be) run on it.
+
+| GPU | Architecture | Status | Notes |
+|---|---|---|---|
+| AMD Renoir (Ryzen APU, integrated) | GFX9 | **Tier 5 — full pipeline works** | Reference implementation. Needed `AMD_DEBUG=nodcc` (VCN can't encode DCC-compressed surfaces) and a modifier-aware (`DRM_PRIME_2`) import once a real Surface-sourced buffer turned out to be GPU-tiled. |
+| AMD Radeon RX 480 (Polaris, discrete) | GFX8 | **Blocked before Tier 5** — Tier 3 mechanism confirmed | The real Surface-sourced RGBA buffer imports with `resource allocation failed`: confirmed via a controlled test (a genuinely-linear buffer at the *exact same* stride imports fine) that the real buffer itself isn't linear, yet Mesa reports **zero** DRM format modifiers for this format/GPU/usage combo — minigbm falls back to opaque, non-modifier-describable tiling (`TILE_TYPE_DRI`) that `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2` has no way to express. Needs a different import path (likely via Mesa's own DRI/EGL image APIs, letting the driver resolve its own opaque tiling instead of us describing it) — not yet investigated. |
+| Intel Iris Xe (TigerLake-LP, integrated) | Gen12 | **Tier 3 only** | dma-buf import + real hardware encode confirmed (`iHD` driver, `VAEntrypointEncSliceLP`), including the CPU-readback coherency check other GPUs skipped. The real-app Tier 5 pipeline hasn't been attempted on this GPU yet. |
+
+This list is 3 machines because that's what's in this project's own reach, not a completeness
+claim. If you've got other hardware (a different AMD generation, NVIDIA, a different Intel
+generation) and want to help fill this in, see Contributing below — a PR against this table with
+your own findings is exactly the kind of contribution this project can use.
+
 ## Contributing
 
 No CLA, no friction — plain Apache-2.0. If this problem interests you, a PR or a comment on an
