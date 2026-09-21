@@ -96,12 +96,21 @@ VA-API didn't allocate can be imported and correctly encoded from — confirmed 
 GPUs (AMD APU, AMD discrete, Intel iGPU) with a synthetic buffer, then confirmed again against a
 real, live dma-buf pulled out of a running redroid container's own gralloc-backed process; and a
 real Codec2 hardware component (`c2.hardware.encoder.h264`) now registers and lists correctly on
-a live redroid instance. Tier 5 is in progress: a host-side daemon reusing Tier 2/3's encode
-pipeline unchanged (avoiding a much bigger Mesa/LLVM-for-bionic port) is wired all the way into
-the Tier 4 component — a real `C2Work` wrapping a real Android gralloc buffer, driven through the
-genuine `queue_nb()`/`process()`/`onWorkDone_nb()` framework machinery, produces valid, decodable
-H.264. Next: the same test driven by a real app (or `screenrecord`) via `MediaCodec` instead of a
-hand-built `C2Work`. See [DEVLOG.md](DEVLOG.md) for the real progress, session by session.
+a live redroid instance. Tier 5 is done for its original goal: a host-side daemon reusing
+Tier 2/3's encode pipeline unchanged (avoiding a much bigger Mesa/LLVM-for-bionic port) is wired
+all the way into the Tier 4 component, and **a real, unmodified app (`scrcpy`) now records real
+hardware-encoded H.264 video through the genuine Android framework path** (`MediaCodec` →
+`Codec2Client` → our component → the daemon → VA-API/VCN), no crash, valid decodable video
+displayed. Getting there took real work on top of the component itself: four separate bugs in why
+a real app couldn't even see the encoder (HAL instance naming vs. the Framework Compatibility
+Matrix, a missing boot flag, a missing `media_codecs.xml` entry, and `mediaserver`'s own codec-list
+cache going stale before runtime config fixes took effect), then two more once it was visible (AMD
+VCN's DCC-compression restriction on real GPU-tiled buffers, and switching the VA-API import to a
+modifier-aware path using metadata gralloc already attaches to the buffer instead of guessing a
+stride). Next, newly found this same session: the real buffer coming from a genuine
+`Surface`-based capture turns out to be RGBA, not NV12 — our component never declared an expected
+pixel format, so the framework skipped its usual RGBA→YUV conversion step. See
+[DEVLOG.md](DEVLOG.md) for the real progress, session by session.
 
 ## Contributing
 

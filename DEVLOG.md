@@ -1108,3 +1108,134 @@ allocation, not a controlled test pattern.
 actual framework (`MediaCodec`/`Codec2Client`, not a hand-built `C2Work`), which will be the first
 real test of the fixed 512-byte stride assumption against a genuinely externally-produced buffer
 whose actual layout this component doesn't control.
+
+## 2026-09-21 (same day) — Tier 5.6: getting a real app to even see the encoder took four separate bugs
+
+Picked `scrcpy` as the real-app test (drives `MediaCodec`/`MediaCodecList` exactly like any other
+Android app would, via genuine framework APIs, no hand-built `C2Work`). It couldn't see
+`c2.hardware.encoder.h264` in `--list-encoders` at all. Four independent, real bugs, found and
+fixed one at a time by tracing the actual framework code path (not guessing):
+
+1. **Instance name didn't match the FCM pattern.** The service registered itself as
+   `IComponentStore/vaapi`. The Framework Compatibility Matrix only accepts instance names
+   matching `default[0-9]*` or `vendor[0-9]*_software` for this HAL — `vaapi` matched neither, so
+   it was correctly declared in the vendor manifest but silently unusable framework-side. Renamed
+   the service's `getName()`, the AIDL registration path, and `manifest_media_c2_vaapi.xml`'s
+   `<fqname>` all to `default`.
+2. **`debug.stagefright.ccodec` was never set.** It only gets set to `4` (all Codec2 components
+   available) by `redroid.c2.rc`, gated on the `androidboot.use_redroid_c2=1` boot cmdline flag —
+   which the test containers this session weren't passing. Without it Codec2 components are
+   filtered out of `MediaCodecList` entirely regardless of anything else being correct.
+3. **No `media_codecs.xml` entry.** `Codec2InfoBuilder::buildMediaCodecList()` (the actual code
+   behind `MediaCodecList`) requires *both* a successful `Codec2Client::CreateInterfaceByName()`
+   *and* a matching entry in `media_codecs.xml` — confirmed by reading the source, not guessing.
+   Added `<MediaCodec name="c2.hardware.encoder.h264" type="video/avc" />` to
+   `hardware/redroid/omx/media_codecs.xml`.
+4. **Missing `C2StreamProfileLevelInfo` param.** Wrote a diagnostic (`client_test.cpp`, a *system*
+   binary calling `Codec2Client::CreateInterfaceByName`/`ListComponents` directly, bypassing
+   `MediaCodecList` entirely) that proved the interface and the component were both discoverable
+   and correct at that layer — meaning the bug was specifically inside
+   `Codec2InfoBuilder::addSupportedProfileLevels()`, which queries
+   `C2StreamProfileLevelInfo::profile` and silently drops a component with zero reported
+   profile/levels before it ever reaches `MediaCodecList`. `VaapiEncInterface` never declared this
+   param at all. Added it (Constrained Baseline / Level 3, matching what the daemon actually
+   encodes).
+
+All four fixed, `c2.hardware.encoder.h264` still didn't appear in `scrcpy --list-encoders`. Found
+the real reason chasing it further: `MediaCodecList::getInstance()`
+(`frameworks/av/media/libstagefright/MediaCodecList.cpp`) doesn't build the list itself — it asks
+`mediaserver` for it over binder (`getCodecList()`) and caches the *reply* in a function-local
+static for the calling process's lifetime. `mediaserver` builds its own copy lazily, once, on
+first request. Since `media.c2.hal.selection=aidl` / `device_config codec_fwk aidl_hal=true` were
+being set with `setprop`/`device_config put` commands run *after* boot completed, `mediaserver`
+had already built and cached its list using the *old* (HIDL-only, no `default` AIDL store)
+`Codec2Client::GetServiceNames()` result before those fixes took effect — confirmed directly via
+`logcat`'s own `Codec2Client: Available Codec2 services: "software"` line, timestamped seconds
+after boot, well before any of the runtime `setprop` calls ran. No amount of relaunching `scrcpy`
+(a genuinely fresh process each time) could ever see the fix, because it was never mediaserver's
+per-process cache that needed refreshing — `Codec2Client::GetServiceNames()` itself is a
+function-local `static`, but each NEW process (scrcpy-server's own `app_process`, not forked from
+zygote) re-evaluates it fresh from current properties; the actual stale cache lived in
+*mediaserver*, which every process's `MediaCodecList::getInstance()` defers to over binder instead
+of building its own copy. `kill -9`'ing `mediaserver` (letting `init` restart it, now with correct
+properties already in place) was what finally worked: `c2.hardware.encoder.h264 (hw) [vendor]`
+appeared in `scrcpy --list-encoders`.
+
+**Practical fallout**: the boot sequence needs `media.c2.hal.selection=aidl` /
+`device_config codec_fwk aidl_hal=true` set *before* mediaserver's first `getCodecList()` call, not
+just before an app queries it — either via an early-boot property (not currently how the test
+containers are set up) or by killing/restarting mediaserver after applying the runtime fixes, which
+is what every rebuild-and-retest cycle in this tier actually did.
+
+## 2026-09-21 (same day) — Tier 5.7: real hardware encode runs end to end for a real app, two more real bugs found
+
+With `c2.hardware.encoder.h264` finally visible, pointed `scrcpy` at it for real:
+`--video-encoder=c2.hardware.encoder.h264`. First attempt crashed immediately
+(`IllegalStateException: Pending dequeue output buffer request cancelled`) — the daemon's own log
+showed why: `radeonsi: error: ... VCN - DCC surfaces not supported`. A genuine Surface-sourced
+frame (SurfaceFlinger's virtual-display capture, via `GraphicBufferSource`) is a real gralloc
+allocation that can be GPU-tiled *and* DCC-compressed; every earlier tier's test buffers (dumb
+buffers, self-filled `AHardwareBuffer`s) happened to be plain and linear, so this never came up
+until a real app exercised the real path.
+
+**Bug 1 — DCC.** Declared the standard `C2StreamUsageTuning::input = BufferUsage::VIDEO_ENCODER`
+param (same pattern `external/v4l2_codec2`'s `EncodeInterface` uses) so gralloc knows this buffer
+feeds a hardware encoder — confirmed via a diagnostic query (`vaapi_c2client_test` extended to
+query `C2StreamUsageTuning::input` directly) that the value (`65536` = `VIDEO_ENCODER`) does reach
+`CCodec`'s `config->mISConfig->mUsage`. Didn't help: VCN's DCC restriction still fired, because
+`GRALLOC_USAGE_HW_VIDEO_ENCODER` on this stack (`external/minigbm`'s `amdgpu.c`) affects buffer
+*height alignment* and *tiling combination selection*, not compression directly. The actual fix
+was blunter: minigbm's Mesa/radeonsi driver respects `AMD_DEBUG=nodcc` (confirmed present as a
+literal string in `libgallium_dri.so`, paired with `"Disable DCC."`). Since Mesa reads this from
+the environment of whichever process allocates the buffer (`surfaceflinger`, compositing the
+capture), and `/system`'s `surfaceflinger.rc` is read-only at runtime (can't add `setenv` there
+directly), added a small vendor init script instead —
+`/vendor/etc/init/redroid-nodcc.rc`:
+```
+on early-init
+    export AMD_DEBUG nodcc
+```
+`init` parses `/vendor/etc/init/*.rc` automatically (no manifest registration needed, confirmed by
+reading `LoadBootScripts()` in `system/core/init/init.cpp`) and `export` calls plain `setenv()` in
+init's own process — inherited by every service init `fork()`s afterward. First attempt at this
+silently failed to take effect at all (confirmed via `/proc/<surfaceflinger-pid>/environ`, which
+lacked the variable): `init` refuses to parse any `.rc` file that's group- or world-writable for
+security (`system/core/init/util.cpp`), and the file had landed as `-rw-rw-r--` after `docker cp`
+instead of the `-rw-r--r--` the other `.rc` files in that directory have. Fixing the source file's
+permissions on the host before `docker cp`-ing it into the stopped-but-not-yet-started container
+fixed it — confirmed `AMD_DEBUG=nodcc` present in `surfaceflinger`'s own `/proc/PID/environ`.
+
+With DCC disabled, the crash was gone — scrcpy displayed real decoded video for the first time.
+But the picture was corrupted (vertical striping), which is the classic symptom of GPU-tiled
+memory being read as if it were plain linear raster: `AMD_DEBUG=nodcc` only disables
+*compression*, not *tiling* itself, and the daemon's VA-API import
+(`VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME`) has no way to describe a tiling/modifier at all — it
+always assumes linear.
+
+**Bug 2 — tiling/stride guessing.** Rather than fight Mesa into forcing fully linear allocation,
+used the real metadata gralloc already attaches to the buffer: `external/minigbm`'s
+`cros_gralloc_handle` (`cros_gralloc/cros_gralloc_handle.h`) packs the actual width, height,
+per-plane strides/offsets, and the DRM format modifier directly into the buffer's own
+`native_handle_t`. Read it directly in `process()` (`reinterpret_cast` the `C2Handle*` to
+`cros_gralloc_handle_t`, `header_libs: ["minigbm_headers"]` in `Android.bp` for the include path),
+extended `protocol.h`'s `EncodeRequest` with a `drm_format_modifier` field, and switched the
+daemon from the old modifier-blind `VASurfaceAttribExternalBuffers` (`DRM_PRIME`) import to the
+modifier-aware `VADRMPRIMESurfaceDescriptor` (`DRM_PRIME_2`), which lets the driver interpret
+whatever tiling layout the buffer actually has instead of assuming linear.
+
+**Confirmed real hardware H.264 encode now runs end to end for a genuine, unmodified app** — no
+crash, valid decodable video displayed by `scrcpy` via the real `MediaCodec` framework path. This
+is the actual Tier 5 milestone.
+
+**New, different bug found closing this one out**: the `cros_gralloc_handle` cast that worked for
+every earlier tier's *self-allocated* test buffers does NOT hold for this real Surface-sourced
+buffer — a raw dump of the handle's ints showed only 23 payload ints (92 bytes) where the full
+struct needs 36 (144 bytes), and the values present (a 2560-byte row stride against a 640-pixel
+width — exactly 4 bytes/pixel) point to the real buffer being **RGBA, not NV12**. Our interface
+never declared an expected pixel format, so `CCodec` left the input as
+`OMX_COLOR_FormatAndroidOpaque` (confirmed in logcat: `color-format = 2130708361`) and
+`GraphicBufferSource` handed over SurfaceFlinger's raw GL-composited output instead of running its
+own RGBA→YUV conversion pass first. Next tier: either find what makes `GraphicBufferSource` do
+that conversion (the "correct", standard path real hardware encoders rely on), or accept RGBA and
+convert to NV12 before handing frames to the daemon (VA-API can also take an RGB32 surface
+directly and do the colorspace conversion itself during encode).

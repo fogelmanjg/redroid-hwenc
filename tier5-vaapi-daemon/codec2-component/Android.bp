@@ -22,9 +22,13 @@ cc_library_static {
         "libcutils",
         "liblog",
         "libstagefright_foundation",
+        "android.hardware.graphics.common@1.0",
     ],
     export_shared_lib_headers: [
         "libcodec2_soft_common",
+    ],
+    header_libs: [
+        "minigbm_headers",
     ],
 
     cflags: [
@@ -64,5 +68,24 @@ cc_binary {
     cflags: [
         "-Wall",
         "-Wno-unused-parameter",
+    ],
+}
+
+// Tier 5.6 diagnostic: calls Codec2Client::CreateInterfaceByName() directly
+// -- the same client-side API Codec2InfoBuilder (feeding MediaCodecList)
+// uses -- to isolate whether *that* specific call is what's failing for our
+// component. Deliberately NOT vendor: true, matching where the real caller
+// (libstagefright, system partition) lives.
+cc_binary {
+    name: "vaapi_c2client_test",
+
+    srcs: [
+        "client_test.cpp",
+    ],
+
+    shared_libs: [
+        "libcodec2_client",
+        "libcodec2",
+        "liblog",
     ],
 }

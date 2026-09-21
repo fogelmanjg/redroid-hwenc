@@ -44,6 +44,15 @@ typedef struct {
     uint32_t stride_uv;   /* plane 1 (interleaved UV) row stride, bytes */
     uint32_t offset_uv;   /* plane 1 offset within the same dma-buf, bytes */
     uint32_t dmabuf_size; /* total dma-buf size, bytes -- sanity check on the server side */
+    /* Tier 5.7 finding: a buffer that comes from a real gralloc allocation
+     * (as opposed to the dumb/synthetic buffers earlier tiers used) can be
+     * GPU-tiled even with DCC disabled (AMD_DEBUG=nodcc only turns off
+     * *compression*, not tiling) -- importing it as if it were a plain
+     * linear NV12 raster produces a garbled, striped decode. cros_gralloc's
+     * native handle (cros_gralloc_handle.h) carries the real DRM format
+     * modifier alongside the buffer; forwarding it here lets the daemon use
+     * VA-API's modifier-aware DRM_PRIME_2 import instead of guessing LINEAR. */
+    uint64_t drm_format_modifier;
 } EncodeRequest;
 
 typedef struct {

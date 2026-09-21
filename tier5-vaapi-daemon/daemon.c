@@ -29,6 +29,7 @@
 #include <va/va_drm.h>
 #include <va/va_drmcommon.h>
 #include <va/va_enc_h264.h>
+#include <drm/drm_fourcc.h>
 
 #include "protocol.h"
 
@@ -284,29 +285,44 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
                               unsigned char **out_buf) {
     if (vaapi_state_ensure_resolution(st, req->width, req->height) != 0) return -1;
 
-    uintptr_t buffer_handles[1] = {(uintptr_t)dmabuf_fd};
-    VASurfaceAttribExternalBuffers ext_buf = {0};
-    ext_buf.pixel_format = VA_FOURCC_NV12;
-    ext_buf.width = req->width;
-    ext_buf.height = req->height;
-    ext_buf.data_size = req->dmabuf_size;
-    ext_buf.num_planes = 2;
-    ext_buf.pitches[0] = req->stride_y;
-    ext_buf.pitches[1] = req->stride_uv;
-    ext_buf.offsets[0] = 0;
-    ext_buf.offsets[1] = req->offset_uv;
-    ext_buf.buffers = buffer_handles;
-    ext_buf.num_buffers = 1;
+    /* Tier 5.7 finding: VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME (the old path
+     * used up through Tier 5.6) has no way to describe a DRM format
+     * modifier -- it always assumes the buffer is a plain linear NV12
+     * raster. That held for every earlier tier's synthetic/dumb buffers
+     * (which genuinely were linear) but not for a real gralloc-allocated
+     * Surface buffer, which can be GPU-tiled even with DCC compression
+     * disabled (AMD_DEBUG=nodcc only affects compression, not tiling) --
+     * importing a tiled buffer this way produced a garbled, striped decode.
+     * DRM_PRIME_2 (VADRMPRIMESurfaceDescriptor) carries the modifier the
+     * component read out of cros_gralloc's native handle, so the driver
+     * interprets the memory layout correctly regardless of tiling. */
+    VADRMPRIMESurfaceDescriptor prime_desc = {0};
+    prime_desc.fourcc = VA_FOURCC_NV12;
+    prime_desc.width = req->width;
+    prime_desc.height = req->height;
+    prime_desc.num_objects = 1;
+    prime_desc.objects[0].fd = dmabuf_fd;
+    prime_desc.objects[0].size = req->dmabuf_size;
+    prime_desc.objects[0].drm_format_modifier = req->drm_format_modifier;
+    prime_desc.num_layers = 1;
+    prime_desc.layers[0].drm_format = DRM_FORMAT_NV12;
+    prime_desc.layers[0].num_planes = 2;
+    prime_desc.layers[0].object_index[0] = 0;
+    prime_desc.layers[0].object_index[1] = 0;
+    prime_desc.layers[0].offset[0] = 0;
+    prime_desc.layers[0].offset[1] = req->offset_uv;
+    prime_desc.layers[0].pitch[0] = req->stride_y;
+    prime_desc.layers[0].pitch[1] = req->stride_uv;
 
     VASurfaceAttrib import_attribs[2];
     import_attribs[0].type = VASurfaceAttribMemoryType;
     import_attribs[0].flags = VA_SURFACE_ATTRIB_SETTABLE;
     import_attribs[0].value.type = VAGenericValueTypeInteger;
-    import_attribs[0].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME;
+    import_attribs[0].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
     import_attribs[1].type = VASurfaceAttribExternalBufferDescriptor;
     import_attribs[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
     import_attribs[1].value.type = VAGenericValueTypePointer;
-    import_attribs[1].value.value.p = &ext_buf;
+    import_attribs[1].value.value.p = &prime_desc;
 
     VAStatus st_import = vaCreateSurfaces(st->dpy, VA_RT_FORMAT_YUV420, req->width, req->height,
                                            &st->surfaces[0], 1, import_attribs, 2);

@@ -9,9 +9,13 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <string>
+
 #include <log/log.h>
 #include <media/stagefright/MediaDefs.h>
 #include <util/C2InterfaceHelper.h>
+
+#include <cros_gralloc/cros_gralloc_handle.h>
 
 #include "protocol.h"
 
@@ -35,6 +39,34 @@ VaapiEncInterface::VaapiEncInterface(const std::shared_ptr<C2ReflectorHelper> &h
                          })
                          .withSetter(SizeSetter)
                          .build());
+
+    addParameter(DefineParam(mInputUsage, C2_PARAMKEY_INPUT_STREAM_USAGE)
+                         .withConstValue(new C2StreamUsageTuning::input(
+                                 0u,
+                                 static_cast<uint64_t>(
+                                         android::hardware::graphics::common::V1_0::BufferUsage::
+                                                 VIDEO_ENCODER)))
+                         .build());
+
+    addParameter(DefineParam(mProfileLevel, C2_PARAMKEY_PROFILE_LEVEL)
+                         .withDefault(new C2StreamProfileLevelInfo::output(
+                                 0u, PROFILE_AVC_CONSTRAINED_BASELINE, LEVEL_AVC_3))
+                         .withFields({
+                                 C2F(mProfileLevel, profile).oneOf({
+                                         PROFILE_AVC_CONSTRAINED_BASELINE,
+                                 }),
+                                 C2F(mProfileLevel, level).oneOf({
+                                         LEVEL_AVC_3,
+                                 }),
+                         })
+                         .withSetter(ProfileLevelSetter)
+                         .build());
+}
+
+C2R VaapiEncInterface::ProfileLevelSetter(bool mayBlock, C2P<C2StreamProfileLevelInfo::output> &me) {
+    (void)mayBlock;
+    (void)me;
+    return C2R::Ok();
 }
 
 C2R VaapiEncInterface::SizeSetter(bool mayBlock, const C2P<C2StreamPictureSizeInfo::input> &oldMe,
@@ -82,7 +114,8 @@ c2_status_t VaapiEncComponent::drain(uint32_t drainMode,
 
 long VaapiEncComponent::encodeViaDaemon(int dmabufFd, uint32_t width, uint32_t height,
                                          uint32_t strideY, uint32_t strideUv, uint32_t offsetUv,
-                                         uint32_t dmabufSize, unsigned char **outBuf) {
+                                         uint32_t dmabufSize, uint64_t drmFormatModifier,
+                                         unsigned char **outBuf) {
     int sockFd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sockFd < 0) {
         ALOGE("socket() failed: %s", strerror(errno));
@@ -104,6 +137,7 @@ long VaapiEncComponent::encodeViaDaemon(int dmabufFd, uint32_t width, uint32_t h
     req.stride_uv = strideUv;
     req.offset_uv = offsetUv;
     req.dmabuf_size = dmabufSize;
+    req.drm_format_modifier = drmFormatModifier;
 
     char cmsgBuf[CMSG_SPACE(sizeof(int))];
     struct iovec iov = {.iov_base = &req, .iov_len = sizeof(req)};
@@ -177,9 +211,13 @@ void VaapiEncComponent::process(const std::unique_ptr<C2Work> &work,
     // small struct of dma-buf fds, no mapper call needed. Deliberately does
     // NOT call block.map()/layout() -- this build's Mapper HAL doesn't
     // implement the flexible-layout verb that needs (confirmed ENOSYS in the
-    // Tier 5.4 gralloc probe), so the stride the framework's own buffer was
-    // laid out with isn't queryable that way here. Using the fixed aligned
-    // stride Tier 5.4 already proved works instead.
+    // Tier 5.4 gralloc probe). Tier 5.7 finding: this gralloc (cros_gralloc,
+    // from external/minigbm) packs the real width/height/strides/offsets AND
+    // the DRM format modifier directly into its own native_handle_t layout
+    // (cros_gralloc_handle.h) -- reading that struct directly gets the real
+    // metadata instead of guessing a stride, which silently produced a
+    // garbled/tiled-as-linear decode for any buffer gralloc didn't allocate
+    // LINEAR (confirmed: a real Surface-sourced frame from scrcpy).
     C2ConstGraphicBlock block = inputBuffer->data().graphicBlocks().front();
     const C2Handle *const handle = block.handle();
     if (!handle || handle->numFds < 1) {
@@ -188,17 +226,35 @@ void VaapiEncComponent::process(const std::unique_ptr<C2Work> &work,
         work->workletsProcessed = 1u;
         return;
     }
-    int dmabufFd = handle->data[0];
-
-    uint32_t width = mIntf->width();
-    uint32_t height = mIntf->height();
-    uint32_t stride = 512;  // matches Tier 5.4's finding: VA-API/radeonsi needs this alignment
-    uint32_t offsetUv = stride * height;
-    uint32_t dmabufSize = offsetUv + (stride * height / 2);
+    // Tier 5.7 finding: a real Surface-sourced frame (scrcpy's virtual
+    // display capture via GraphicBufferSource) does NOT arrive as a full
+    // cros_gralloc_handle here -- a raw dump showed only 23 payload ints
+    // (92 bytes) vs. the 144 needed for that struct, and the values present
+    // (a 2560-byte stride against a 640-pixel width -- exactly 4 bytes/px)
+    // point to this buffer being RGBA, not NV12. Our interface never
+    // declared a pixel format, so CCodec left the input as
+    // OMX_COLOR_FormatAndroidOpaque (confirmed in logcat:
+    // color-format = 2130708361) and GraphicBufferSource handed us
+    // SurfaceFlinger's raw GL-composited output instead of running its own
+    // RGBA->YUV conversion pass. The cros_gralloc_handle cast below is
+    // therefore WRONG for this real-buffer case (worked only for the
+    // earlier tiers' self-allocated test buffers) -- left in place as the
+    // last known-working step; next tier needs to either force real YUV
+    // output (find what makes GraphicBufferSource convert) or accept RGBA
+    // and convert before handing frames to the VA-API daemon.
+    cros_gralloc_handle_t crosHandle = reinterpret_cast<cros_gralloc_handle_t>(handle);
+    int dmabufFd = crosHandle->fds[0];
+    uint32_t width = crosHandle->width;
+    uint32_t height = crosHandle->height;
+    uint32_t strideY = crosHandle->strides[0];
+    uint32_t strideUv = crosHandle->num_planes > 1 ? crosHandle->strides[1] : strideY;
+    uint32_t offsetUv = crosHandle->num_planes > 1 ? crosHandle->offsets[1] : 0;
+    uint32_t dmabufSize = crosHandle->total_size;
+    uint64_t drmFormatModifier = crosHandle->format_modifier;
 
     unsigned char *coded = nullptr;
-    long codedSize = encodeViaDaemon(dmabufFd, width, height, stride, stride, offsetUv,
-                                      dmabufSize, &coded);
+    long codedSize = encodeViaDaemon(dmabufFd, width, height, strideY, strideUv, offsetUv,
+                                      dmabufSize, drmFormatModifier, &coded);
     if (codedSize < 0) {
         work->result = C2_CORRUPTED;
         work->workletsProcessed = 1u;
