@@ -1,5 +1,7 @@
 daemon
 test-client
 rgba-test-client
+gbm-render-test-client
 out.h264
 rgba-test-out.h264
+gbm-render-test-out.h264

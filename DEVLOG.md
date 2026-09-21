@@ -1468,3 +1468,68 @@ one new step — import via plain `EGL_LINUX_DMA_BUF_EXT` (no modifier), GPU-bli
 fresh, definitely-linear buffer allocated the normal way, and hand *that* to the daemon's existing
 `DRM_PRIME_2`/VPP/encode code exactly as-is. Not implemented yet (this session ran out of budget
 right as the mechanism got confirmed) — next session's concrete task, not an open question anymore.
+
+**CORRECTION (see next entry): this "confirmation" turned out to be a false positive.** The probe
+tested same-process self-import (the process that allocated the buffer immediately re-importing
+its own fd), which is NOT the scenario that actually matters -- the daemon receives the fd from a
+*different* process (the real Android component, or this test's own client). Re-tested properly
+cross-process and it fails. Left the entry above as-is (rather than rewriting history) so the
+methodology mistake is visible, not just the correction.
+
+## 2026-09-21 (same day) — Tier 5.10 implementation attempt: the "confirmed" bridge doesn't survive contact with the real (cross-process) case
+
+Implemented the bridge designed in the previous entry: `rgba_modifier_init()` now sets
+`st->needs_egl_bridge` instead of silently assuming LINEAR when a GPU reports zero modifiers, and
+`egl_bridge_convert_to_linear()` does the import-via-plain-EGL / GPU-blit-into-a-fresh-
+`GBM_BO_USE_LINEAR`-buffer dance from the previous entry, called from `encode_one_frame()` ahead of
+the existing (unchanged) `DRM_PRIME_2`/VPP/encode path.
+
+**First, a real regression that had nothing to do with any of this**, worth recording since it cost
+real time: after wiring the bridge in, server01's own working case (`rgba-test-client.c`, unrelated
+to the bridge -- `needs_egl_bridge` stays false there) started failing with the exact
+"resource allocation failed" this whole tier is about. Chased it hard: reverted the GBM/EGL
+lifetime management several different ways (separate fd from `st->drm_fd`, releasing the EGL
+context immediately after use, deferring context creation until actually needed, fully
+`eglTerminate()`-ing when unused) -- none of it mattered. Proved it wasn't a code regression at all
+by rebuilding the *exact*, unmodified, previously-working binary from the last commit and running
+the identical test against it: it failed too. Root cause: **server01's GPU had genuine VRAM
+pressure from other, unrelated production redroid containers that had been running for 17+ hours**
+(`mem_info_vram_used` / `mem_info_vram_total`: 466MB / 512MB, 91%) -- nothing to do with this
+session's code at all. Didn't touch those containers (production, not this project's to stop).
+Moved testing to `jgustavo46` instead, which is where the bridge is actually needed anyway.
+
+**On `jgustavo46`, the bridge's own import step failed**: `egl_bridge: glEGLImageTargetTexture2DOES
+err=0x501` (`GL_INVALID_VALUE`), immediately after `eglCreateImageKHR` itself had *succeeded* (no
+error from that call) -- for a `GBM_BO_USE_RENDERING` buffer, the same class the real pipeline
+uses, sent to the daemon exactly the way a real request would arrive (a separate test client
+process, dma-buf fd handed over via `SCM_RIGHTS`, matching the real Android→daemon handoff).
+
+Added a self-check directly into that same test client: immediately after creating the buffer,
+before ever sending anything to the daemon, re-import that *exact same* fd via
+`EGL_LINUX_DMA_BUF_EXT` **within the client's own process** and try to bind it as a texture, the
+identical sequence the standalone probe (previous entry) ran. Result: **same-process import
+succeeds perfectly** (`err=0x0`) -- confirming the previous entry's probe wasn't wrong about what
+it tested, it just tested the wrong thing. The daemon's own, genuinely cross-process import of the
+identical fd, moments later, fails. This isolates the real cause precisely: Mesa's plain
+(non-modifier) `EGL_LINUX_DMA_BUF_EXT` import on this GPU only works when the importing process is
+the *same* one that allocated the buffer -- almost certainly because Mesa recognizes its own
+already-tracked GEM object via internal state (an allocator-side cache keyed by something like the
+underlying inode, not a genuine tiling-from-parameters derivation), rather than actually resolving
+the opaque tiling from a foreign dma-buf the way the extension's name would suggest. A different
+process, going through the kernel's real PRIME import path with no such shortcut available, gets
+none of that benefit.
+
+**Conclusion: the Tier 5.10 fix direction from the previous entry does not work for the case that
+actually matters.** Polaris/GFX8 remains blocked, and this specific bridge idea is a dead end, not
+a not-yet-implemented one. Left in the daemon code (harmless -- reachable only when
+`needs_egl_bridge` is set, which is only this GPU class) as a documented, working-but-insufficient
+attempt, rather than deleted, since the same-process/cross-process distinction it surfaced is
+itself the useful finding for whoever picks this up next. Possible next directions, none explored
+yet: some AMD-specific out-of-band tiling metadata channel (the legacy
+`amdgpu_bo_set_metadata`/`amdgpu_bo_query_info` sideband this session already ruled out for
+*reading* an existing buffer's tiling, but conceivably usable differently); forcing the real
+buffer's allocation to genuinely request `GBM_BO_USE_LINEAR` at the point Android's gralloc creates
+it (upstream of anything this daemon controls, and not clearly possible without patching minigbm
+itself, which the very first entry on this GPU already flagged as the "expensive in the best case"
+option); or accepting this specific GPU generation as unsupported for now and prioritizing a third,
+different GPU/vendor instead.

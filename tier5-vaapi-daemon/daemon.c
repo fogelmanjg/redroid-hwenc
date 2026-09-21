@@ -34,8 +34,11 @@
 
 #include <gbm.h>
 #define EGL_EGLEXT_PROTOTYPES
+#define GL_GLEXT_PROTOTYPES
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 
 #include "protocol.h"
 
@@ -235,7 +238,162 @@ typedef struct {
      * the Android-side component (an AOSP rebuild, tied to a single build
      * host). See rgba_modifier_init() for how. */
     uint64_t rgba_modifier;
+    /* Tier 5.10: some GPUs (confirmed: Polaris/GFX8) report *zero* DRM
+     * format modifiers for a GPU-render-target RGBA buffer at all -- there
+     * is no modifier value that describes their tiling, because minigbm
+     * falls back to Mesa-opaque, non-modifier tiling (TILE_TYPE_DRI) for
+     * that combination. DRM_PRIME_2 fundamentally cannot import a buffer
+     * like that (confirmed: a genuinely-linear buffer at the exact same
+     * stride imports fine, so it's specifically about the tiling, not a
+     * geometry mistake). needs_egl_bridge, set once at startup, means
+     * encode_one_frame() bounces the buffer through GL first instead --
+     * see egl_bridge_convert_to_linear()'s own comment for the important
+     * caveat: this does NOT actually fix Polaris/GFX8 (confirmed cross-
+     * process import still fails there), it's kept because the mechanism
+     * may still be exactly right for some *other* GPU whose opaque tiling
+     * genuinely can be resolved cross-process, which hasn't been tried. */
+    int needs_egl_bridge;
+    struct gbm_device *gbm;
+    EGLDisplay egl_dpy;
+    EGLContext egl_ctx;
+    GLuint blit_program;
+    GLint blit_tex_uniform;
+    GLuint blit_vbo;
 } vaapi_state_t;
+
+static PFNEGLCREATEIMAGEKHRPROC pEglCreateImageKHR;
+static PFNEGLDESTROYIMAGEKHRPROC pEglDestroyImageKHR;
+static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC pGlEGLImageTargetTexture2DOES;
+
+static GLuint compile_shader(GLenum type, const char *src) {
+    GLuint shader = glCreateShader(type);
+    glShaderSource(shader, 1, &src, NULL);
+    glCompileShader(shader);
+    GLint ok = 0;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        glGetShaderInfoLog(shader, sizeof(log), NULL, log);
+        fprintf(stderr, "shader compile failed: %s\n", log);
+        return 0;
+    }
+    return shader;
+}
+
+static GLuint link_blit_program(void) {
+    /* Deliberately trivial: samples the source texture and writes it
+     * straight through. Both ends of this copy are plain offscreen
+     * buffers (no window-system Y-flip conventions in play), so a direct
+     * 1:1 mapping is correct. */
+    static const char *vs_src =
+        "attribute vec2 aPos;\n"
+        "varying vec2 vTex;\n"
+        "void main() {\n"
+        "    vTex = aPos * 0.5 + 0.5;\n"
+        "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
+        "}\n";
+    static const char *fs_src =
+        "precision mediump float;\n"
+        "varying vec2 vTex;\n"
+        "uniform sampler2D uTex;\n"
+        "void main() {\n"
+        "    gl_FragColor = texture2D(uTex, vTex);\n"
+        "}\n";
+    GLuint vs = compile_shader(GL_VERTEX_SHADER, vs_src);
+    GLuint fs = compile_shader(GL_FRAGMENT_SHADER, fs_src);
+    if (!vs || !fs) return 0;
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    glBindAttribLocation(prog, 0, "aPos");
+    glLinkProgram(prog);
+    GLint ok = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    if (!ok) {
+        char log[512];
+        glGetProgramInfoLog(prog, sizeof(log), NULL, log);
+        fprintf(stderr, "program link failed: %s\n", log);
+        return 0;
+    }
+    return prog;
+}
+
+/* Tier 5.10: the bridge's persistent GBM+EGL+GLES2 context, created only
+ * when rgba_modifier_init() below has determined it's actually needed --
+ * confirmed the hard way that merely *creating* a GBM device + EGL display
+ * in this process at all (even one immediately destroyed again right after
+ * a modifier query, never advancing to a context) made VA-API's own,
+ * unrelated dma-buf import start failing with "resource allocation failed"
+ * on server01 -- for a request that worked before any of this existed, on
+ * a GPU that never needs the bridge. Whatever that interaction is, this
+ * daemon now only ever creates GBM/EGL state on a GPU that has already
+ * been confirmed (via rgba_modifier_init()'s own short-lived, self-
+ * contained probe) to need it. */
+static int gl_bridge_context_init(vaapi_state_t *st) {
+    int gbm_fd = open(DRM_RENDER_DEVICE, O_RDWR);
+    if (gbm_fd < 0) {
+        perror("gl_bridge_context_init: open " DRM_RENDER_DEVICE);
+        return -1;
+    }
+    st->gbm = gbm_create_device(gbm_fd);
+    if (!st->gbm) {
+        fprintf(stderr, "gl_bridge_context_init: gbm_create_device failed\n");
+        return -1;
+    }
+    st->egl_dpy = eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, st->gbm, NULL);
+    EGLint major, minor;
+    if (st->egl_dpy == EGL_NO_DISPLAY || !eglInitialize(st->egl_dpy, &major, &minor)) {
+        fprintf(stderr, "gl_bridge_context_init: eglInitialize failed\n");
+        return -1;
+    }
+    eglBindAPI(EGL_OPENGL_ES_API);
+    /* No EGL_SURFACE_TYPE constraint: this is a surfaceless context (never
+     * bound to a real window/pbuffer surface), and asking for
+     * EGL_PBUFFER_BIT here fails outright on a GBM-platform display that
+     * doesn't offer pbuffer-capable configs (confirmed the hard way in the
+     * standalone probe -- silent EGL_BAD_CONFIG cascading into every later
+     * call quietly no-op'ing against no current context). */
+    EGLint cfg_attribs[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_NONE};
+    EGLConfig cfg;
+    EGLint num_cfg = 0;
+    eglChooseConfig(st->egl_dpy, cfg_attribs, &cfg, 1, &num_cfg);
+    if (num_cfg == 0) {
+        fprintf(stderr, "gl_bridge_context_init: eglChooseConfig found no config\n");
+        return -1;
+    }
+    EGLint ctx_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+    st->egl_ctx = eglCreateContext(st->egl_dpy, cfg, EGL_NO_CONTEXT, ctx_attribs);
+    if (st->egl_ctx == EGL_NO_CONTEXT) {
+        fprintf(stderr, "gl_bridge_context_init: eglCreateContext failed: 0x%x\n", eglGetError());
+        return -1;
+    }
+    if (!eglMakeCurrent(st->egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, st->egl_ctx)) {
+        fprintf(stderr, "gl_bridge_context_init: eglMakeCurrent failed: 0x%x\n", eglGetError());
+        return -1;
+    }
+
+    pEglCreateImageKHR = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+    pEglDestroyImageKHR = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+    pGlEGLImageTargetTexture2DOES =
+        (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+    if (!pEglCreateImageKHR || !pEglDestroyImageKHR || !pGlEGLImageTargetTexture2DOES) {
+        fprintf(stderr, "gl_bridge_context_init: missing required EGL/GL extension entry points\n");
+        return -1;
+    }
+
+    st->blit_program = link_blit_program();
+    if (!st->blit_program) return -1;
+    st->blit_tex_uniform = glGetUniformLocation(st->blit_program, "uTex");
+
+    static const GLfloat quad[] = {-1, -1, 1, -1, -1, 1, 1, 1};
+    glGenBuffers(1, &st->blit_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, st->blit_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+
+    return 0;
+}
 
 /* Tier 5.9: reproduces minigbm's own tie-break for which tiling a
  * GPU-render-target RGBA buffer gets (amdgpu.c's amdgpu_add_kms_item():
@@ -254,10 +412,25 @@ typedef struct {
  * a DCC-compressed tiling at all (VCN can't encode from those, confirmed
  * in Tier 5.7) -- without nodcc here too, this queries 8 modifiers instead
  * of 4 and the first one has DCC=1: a decision the real allocation was
- * never actually given the chance to make. */
-static uint64_t rgba_modifier_init(int drm_fd) {
+ * never actually given the chance to make.
+ *
+ * Tier 5.10: zero modifiers reported doesn't mean LINEAR here -- it means
+ * this GPU can't describe its render-target tiling as a modifier at all
+ * (confirmed: Polaris/GFX8). Sets st->needs_egl_bridge in that case instead
+ * of silently assuming LINEAR (which produced "resource allocation failed"
+ * on that GPU -- a genuinely-linear buffer at the identical stride imports
+ * fine, proving the real buffer just isn't linear).
+ *
+ * Deliberately self-contained (creates and destroys its own throwaway
+ * GBM/EGL, using st->drm_fd) rather than reusing any longer-lived state --
+ * confirmed the hard way (see gl_bridge_context_init()'s comment) that
+ * *any* longer-lived GBM/EGL object in this process, even on a GPU that
+ * never touches it again, disturbs VA-API's own unrelated dma-buf import.
+ * A query-and-destroy right here, before VA-API has imported anything for
+ * real yet, doesn't have that problem. */
+static uint64_t rgba_modifier_init(vaapi_state_t *st) {
     uint64_t fallback = DRM_FORMAT_MOD_LINEAR;
-    struct gbm_device *gbm = gbm_create_device(drm_fd);
+    struct gbm_device *gbm = gbm_create_device(st->drm_fd);
     if (!gbm) {
         fprintf(stderr, "rgba_modifier_init: gbm_create_device failed, assuming LINEAR\n");
         return fallback;
@@ -274,7 +447,10 @@ static uint64_t rgba_modifier_init(int drm_fd) {
     EGLint num_mods = 0;
     if (!queryMods || !queryMods(dpy, DRM_FORMAT_ABGR8888, 0, NULL, NULL, &num_mods) ||
         num_mods == 0) {
-        fprintf(stderr, "rgba_modifier_init: no modifiers reported, assuming LINEAR\n");
+        fprintf(stderr,
+                "rgba_modifier_init: no modifiers reported for this GPU -- opaque tiling, "
+                "enabling the EGL bridge\n");
+        st->needs_egl_bridge = 1;
         gbm_device_destroy(gbm);
         return fallback;
     }
@@ -288,6 +464,160 @@ static uint64_t rgba_modifier_init(int drm_fd) {
     free(external);
     gbm_device_destroy(gbm);
     return chosen;
+}
+
+/* Tier 5.10: the bridge. Imports src_fd (whatever opaque tiling this GPU
+ * gave the real buffer) via plain, non-modifier EGL import, GPU-blits it
+ * into a fresh GBM_BO_USE_LINEAR buffer (this driver's own explicit,
+ * always-linear allocation path -- confirmed a real combination exists by
+ * simply trying it), and hands back that buffer's own fd/stride/size for
+ * the caller to import into VA-API exactly like any other request, with
+ * modifier=DRM_FORMAT_MOD_LINEAR (now actually true). Caller owns *out_bo
+ * and must gbm_bo_destroy() it (which also invalidates *out_fd) once done
+ * with the encode.
+ *
+ * IMPORTANT, confirmed on Polaris/GFX8 (see DEVLOG Tier 5.10 for the full
+ * story): the *source* import below (src_image) only actually works when
+ * the process calling this function is the same one that allocated
+ * src_fd's buffer. It fails with GL_INVALID_VALUE for a genuinely foreign
+ * fd -- e.g. exactly the real case, this daemon receiving src_fd from a
+ * different process over SCM_RIGHTS. Mesa's same-process success is
+ * apparently a shortcut (recognizing its own already-tracked GEM object),
+ * not genuine cross-process opaque-tiling resolution. This function is not
+ * a working fix for that GPU. Left in (reachable only when
+ * needs_egl_bridge is set) because a *different* GPU's opaque tiling might
+ * genuinely be cross-process-resolvable this way -- untested, no such GPU
+ * available yet. */
+static int egl_bridge_convert_to_linear(vaapi_state_t *st, int src_fd, uint32_t width,
+                                         uint32_t height, uint32_t src_stride,
+                                         struct gbm_bo **out_bo, int *out_fd, uint32_t *out_stride,
+                                         uint32_t *out_size) {
+    eglMakeCurrent(st->egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, st->egl_ctx);
+
+    EGLint src_attribs[] = {
+        EGL_WIDTH,
+        (EGLint)width,
+        EGL_HEIGHT,
+        (EGLint)height,
+        EGL_LINUX_DRM_FOURCC_EXT,
+        DRM_FORMAT_ABGR8888,
+        EGL_DMA_BUF_PLANE0_FD_EXT,
+        src_fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+        0,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT,
+        (EGLint)src_stride,
+        EGL_NONE,
+    };
+    EGLImageKHR src_image = pEglCreateImageKHR(st->egl_dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT,
+                                                (EGLClientBuffer)NULL, src_attribs);
+    if (src_image == EGL_NO_IMAGE_KHR) {
+        fprintf(stderr, "egl_bridge: source import failed: 0x%x\n", eglGetError());
+        return -1;
+    }
+
+    GLuint src_tex = 0;
+    glGenTextures(1, &src_tex);
+    glBindTexture(GL_TEXTURE_2D, src_tex);
+    pGlEGLImageTargetTexture2DOES(GL_TEXTURE_2D, src_image);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if (glGetError() != GL_NO_ERROR) {
+        fprintf(stderr, "egl_bridge: binding source EGLImage as texture failed\n");
+        glDeleteTextures(1, &src_tex);
+        pEglDestroyImageKHR(st->egl_dpy, src_image);
+        return -1;
+    }
+
+    struct gbm_bo *dst_bo = gbm_bo_create(st->gbm, width, height, GBM_FORMAT_ABGR8888,
+                                           GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
+    if (!dst_bo) {
+        fprintf(stderr, "egl_bridge: gbm_bo_create(LINEAR) failed\n");
+        glDeleteTextures(1, &src_tex);
+        pEglDestroyImageKHR(st->egl_dpy, src_image);
+        return -1;
+    }
+    int dst_fd = gbm_bo_get_fd(dst_bo);
+    uint32_t dst_stride = gbm_bo_get_stride(dst_bo);
+
+    EGLint dst_attribs[] = {
+        EGL_WIDTH,
+        (EGLint)width,
+        EGL_HEIGHT,
+        (EGLint)height,
+        EGL_LINUX_DRM_FOURCC_EXT,
+        DRM_FORMAT_ABGR8888,
+        EGL_DMA_BUF_PLANE0_FD_EXT,
+        dst_fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+        0,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT,
+        (EGLint)dst_stride,
+        EGL_NONE,
+    };
+    EGLImageKHR dst_image = pEglCreateImageKHR(st->egl_dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT,
+                                                (EGLClientBuffer)NULL, dst_attribs);
+    if (dst_image == EGL_NO_IMAGE_KHR) {
+        fprintf(stderr, "egl_bridge: dest import failed: 0x%x\n", eglGetError());
+        glDeleteTextures(1, &src_tex);
+        pEglDestroyImageKHR(st->egl_dpy, src_image);
+        close(dst_fd);
+        gbm_bo_destroy(dst_bo);
+        return -1;
+    }
+
+    GLuint dst_tex = 0;
+    glGenTextures(1, &dst_tex);
+    glBindTexture(GL_TEXTURE_2D, dst_tex);
+    pGlEGLImageTargetTexture2DOES(GL_TEXTURE_2D, dst_image);
+
+    GLuint fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dst_tex, 0);
+    GLenum fbo_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (fbo_status != GL_FRAMEBUFFER_COMPLETE) {
+        fprintf(stderr, "egl_bridge: destination framebuffer incomplete: 0x%x\n", fbo_status);
+        glDeleteFramebuffers(1, &fbo);
+        glDeleteTextures(1, &src_tex);
+        glDeleteTextures(1, &dst_tex);
+        pEglDestroyImageKHR(st->egl_dpy, src_image);
+        pEglDestroyImageKHR(st->egl_dpy, dst_image);
+        close(dst_fd);
+        gbm_bo_destroy(dst_bo);
+        return -1;
+    }
+
+    glViewport(0, 0, (GLint)width, (GLint)height);
+    glUseProgram(st->blit_program);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, src_tex);
+    glUniform1i(st->blit_tex_uniform, 0);
+    glBindBuffer(GL_ARRAY_BUFFER, st->blit_vbo);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glFinish();
+
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &src_tex);
+    glDeleteTextures(1, &dst_tex);
+    pEglDestroyImageKHR(st->egl_dpy, src_image);
+    pEglDestroyImageKHR(st->egl_dpy, dst_image);
+
+    /* Same reasoning as gl_bridge_init(): don't leave this context current
+     * once the GL work is done, or VA-API's own import of the *result*
+     * (which happens right after this returns, still within the same
+     * request) can fail. */
+    eglMakeCurrent(st->egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+
+    *out_bo = dst_bo;
+    *out_fd = dst_fd;
+    *out_stride = dst_stride;
+    *out_size = dst_stride * height;
+    return 0;
 }
 
 static int vaapi_state_init(vaapi_state_t *st) {
@@ -307,7 +637,17 @@ static int vaapi_state_init(vaapi_state_t *st) {
     fprintf(stderr, "VA-API %d.%d, driver: %s\n", major, minor,
             vaQueryVendorString(st->dpy));
 
-    st->rgba_modifier = rgba_modifier_init(st->drm_fd);
+    st->rgba_modifier = rgba_modifier_init(st);
+    if (st->needs_egl_bridge) {
+        fprintf(stderr,
+                "This GPU can't describe its RGBA render-target tiling as a DRM modifier -- "
+                "every request will be bounced through a GL blit into a fresh linear buffer "
+                "first (see DEVLOG Tier 5.10).\n");
+        if (gl_bridge_context_init(st) != 0) {
+            fprintf(stderr, "gl_bridge_context_init failed -- cannot set up the required bridge\n");
+            return -1;
+        }
+    }
 
     int num_entrypoints = vaMaxNumEntrypoints(st->dpy);
     VAEntrypoint *entrypoints = malloc(num_entrypoints * sizeof(VAEntrypoint));
@@ -421,6 +761,27 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
                               unsigned char **out_buf) {
     if (vaapi_state_ensure_resolution(st, req->width, req->height) != 0) return -1;
 
+    int import_fd = dmabuf_fd;
+    uint32_t import_stride = req->stride_y;
+    uint32_t import_size = req->dmabuf_size;
+    uint64_t import_modifier = st->rgba_modifier;
+    struct gbm_bo *bridge_bo = NULL;
+    int bridge_fd = -1;
+
+    /* Tier 5.10: this GPU can't describe the real buffer's tiling as a DRM
+     * modifier at all (see rgba_modifier_init()) -- bounce it through GL
+     * first so VA-API only ever has to deal with a buffer it already knows
+     * how to import correctly. */
+    if (st->needs_egl_bridge) {
+        if (egl_bridge_convert_to_linear(st, dmabuf_fd, req->width, req->height, req->stride_y,
+                                          &bridge_bo, &bridge_fd, &import_stride,
+                                          &import_size) != 0) {
+            return -1;
+        }
+        import_fd = bridge_fd;
+        import_modifier = DRM_FORMAT_MOD_LINEAR;
+    }
+
     /* Tier 5.7 finding: VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME (the old path
      * used up through Tier 5.6) has no way to describe a DRM format
      * modifier -- it always assumes the buffer is a plain linear raster.
@@ -455,15 +816,15 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
     prime_desc.width = req->width;
     prime_desc.height = req->height;
     prime_desc.num_objects = 1;
-    prime_desc.objects[0].fd = dmabuf_fd;
-    prime_desc.objects[0].size = req->dmabuf_size;
-    prime_desc.objects[0].drm_format_modifier = st->rgba_modifier;
+    prime_desc.objects[0].fd = import_fd;
+    prime_desc.objects[0].size = import_size;
+    prime_desc.objects[0].drm_format_modifier = import_modifier;
     prime_desc.num_layers = 1;
     prime_desc.layers[0].drm_format = DRM_FORMAT_ABGR8888;
     prime_desc.layers[0].num_planes = 1;
     prime_desc.layers[0].object_index[0] = 0;
     prime_desc.layers[0].offset[0] = 0;
-    prime_desc.layers[0].pitch[0] = req->stride_y;
+    prime_desc.layers[0].pitch[0] = import_stride;
 
     VASurfaceAttrib import_attribs[2];
     import_attribs[0].type = VASurfaceAttribMemoryType;
@@ -479,11 +840,19 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
                                            &st->surfaces[0], 1, import_attribs, 2);
     if (st_import != VA_STATUS_SUCCESS) {
         fprintf(stderr, "dma-buf import failed: %s\n", vaErrorStr(st_import));
+        if (bridge_bo) {
+            close(bridge_fd);
+            gbm_bo_destroy(bridge_bo);
+        }
         return -1;
     }
 
     if (convert_rgba_to_nv12(st, st->surfaces[0], req->width, req->height) != 0) {
         vaDestroySurfaces(st->dpy, &st->surfaces[0], 1);
+        if (bridge_bo) {
+            close(bridge_fd);
+            gbm_bo_destroy(bridge_bo);
+        }
         return -1;
     }
 
@@ -595,6 +964,10 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
     vaUnmapBuffer(st->dpy, coded_buf);
     vaDestroyBuffer(st->dpy, coded_buf);
     vaDestroySurfaces(st->dpy, &st->surfaces[0], 1);
+    if (bridge_bo) {
+        close(bridge_fd);
+        gbm_bo_destroy(bridge_bo);
+    }
 
     *out_buf = out;
     return (long)total;
