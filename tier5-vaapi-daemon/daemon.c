@@ -427,7 +427,27 @@ static int gl_bridge_context_init(vaapi_state_t *st) {
  * *any* longer-lived GBM/EGL object in this process, even on a GPU that
  * never touches it again, disturbs VA-API's own unrelated dma-buf import.
  * A query-and-destroy right here, before VA-API has imported anything for
- * real yet, doesn't have that problem. */
+ * real yet, doesn't have that problem.
+ *
+ * Tier 5.11: "index 0 wins" is an AMD-specific fact, not a general one --
+ * confirmed on Intel (TigerLake/gen12, iHD driver): the real buffer came
+ * out visually corrupted (tiled-as-linear striping) despite this exact
+ * function reporting modifier[0] = DRM_FORMAT_MOD_LINEAR and the import
+ * succeeding without error. Read minigbm's *other* backend, i915.c, to
+ * understand why: unlike amdgpu.c (one combination per modifier, all at
+ * equal priority, so registration order -- which matches this query's
+ * order -- decides ties), i915.c registers LINEAR at explicit priority 1
+ * and X/Y/4-tiled at explicit priority 2/3 for the *same* render+encoder
+ * usage whenever the request has no SW/CPU-read/write usage bits (which
+ * ours never does) -- and drv_get_combination() always keeps the highest
+ * priority match. Tiled beats linear on Intel, unconditionally, for this
+ * usage class. Confirmed by comparing the reported modifier list against
+ * i915.c's I915_FORMAT_MOD_Y_TILED constant -- present, and exactly what
+ * minigbm's priority rule would pick for this GPU generation (not MTL+,
+ * which prefers 4-tiled instead; not handled here since no such GPU has
+ * been tested yet). Detected via the VA-API vendor string rather than by
+ * driver library name, since that's already queried at daemon startup
+ * for logging and reliably distinguishes Intel from AMD/other vendors. */
 static uint64_t rgba_modifier_init(vaapi_state_t *st) {
     uint64_t fallback = DRM_FORMAT_MOD_LINEAR;
     struct gbm_device *gbm = gbm_create_device(st->drm_fd);
@@ -457,9 +477,35 @@ static uint64_t rgba_modifier_init(vaapi_state_t *st) {
     EGLuint64KHR *mods = malloc(num_mods * sizeof(EGLuint64KHR));
     EGLBoolean *external = malloc(num_mods * sizeof(EGLBoolean));
     queryMods(dpy, DRM_FORMAT_ABGR8888, num_mods, mods, external, &num_mods);
+
     uint64_t chosen = mods[0];
-    fprintf(stderr, "rgba_modifier_init: %d modifiers for ABGR8888, using first: 0x%016llx\n",
-            num_mods, (unsigned long long)chosen);
+    const char *vendor = vaQueryVendorString(st->dpy);
+    if (vendor && strstr(vendor, "Intel")) {
+        /* I915_FORMAT_MOD_Y_TILED / X_TILED (fourcc_mod_code(INTEL, 2/1)) --
+         * not including drm_fourcc.h's i915-specific header here (kernel
+         * UAPI header, not always present), just the two known numeric
+         * values, per the priority rule above. */
+        const uint64_t y_tiled = 0x0100000000000002ULL;
+        const uint64_t x_tiled = 0x0100000000000001ULL;
+        int found = 0;
+        for (int i = 0; i < num_mods && !found; i++) {
+            if (mods[i] == y_tiled) {
+                chosen = y_tiled;
+                found = 1;
+            }
+        }
+        for (int i = 0; i < num_mods && !found; i++) {
+            if (mods[i] == x_tiled) {
+                chosen = x_tiled;
+                found = 1;
+            }
+        }
+        fprintf(stderr, "rgba_modifier_init: Intel GPU, preferring tiled over linear -> %s\n",
+                found ? (chosen == y_tiled ? "Y_TILED" : "X_TILED") : "none found, using index 0");
+    }
+
+    fprintf(stderr, "rgba_modifier_init: %d modifiers for ABGR8888, using: 0x%016llx\n", num_mods,
+            (unsigned long long)chosen);
     free(mods);
     free(external);
     gbm_device_destroy(gbm);

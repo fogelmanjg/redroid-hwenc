@@ -1533,3 +1533,59 @@ it (upstream of anything this daemon controls, and not clearly possible without 
 itself, which the very first entry on this GPU already flagged as the "expensive in the best case"
 option); or accepting this specific GPU generation as unsupported for now and prioritizing a third,
 different GPU/vendor instead.
+
+## 2026-09-22 — Third GPU, Tier 5 confirmed a second time: Intel Iris Xe (TigerLake), one more real vendor-specific bug found
+
+Took the "third, different GPU/vendor" option from the previous entry's list: `jfogelman-n02`'s
+Intel Iris Xe (TigerLake-LP, `iHD` driver) — the same machine Tier 3's cross-hardware validation
+used months ago, but never with an actual redroid container deployed on it before now. Transferred
+the identical `redroid-jg-15:wifi-v3` image and the identical, unmodified vendor files built on
+server01 (no AOSP rebuild — this is exactly what the Tier 5.9 refactor bought: only the daemon
+needed a local `gcc` build for this new host). `n02` only has one binder device set (unnumbered
+`/dev/binder`/`/dev/hwbinder`/`/dev/vndbinder`, not the numbered `binderN` pattern server01 and
+jgustavo46 use) — used those directly.
+
+The synthetic `gbm-render-test-client.c` test (solid red on a `GBM_BO_USE_RENDERING` buffer)
+passed cleanly first try: `(255, 0, 0)` back, no quantization loss at all (better than AMD's
+`(231, 0, 1)`). `rgba_modifier_init()` reported `DRM_FORMAT_MOD_LINEAR` (`0x0`) as modifier[0] for
+this GPU — a clean, ordinary-looking case, nothing like Polaris's zero-modifiers dead end.
+
+**The real pipeline (`scrcpy` against the real Surface capture) came out corrupted anyway** — the
+exact same tiled-as-linear horizontal-banding signature from the AMD Tier 5.7 investigation,
+despite the daemon reporting a successful LINEAR import with no errors at any stage. This is a
+different bug from anything seen before: not "no modifier exists" (Polaris) and not "wrong specific
+modifier" in the AMD sense (there, index 0 genuinely was correct) — here, **index 0 itself is not
+a safe assumption at all for this vendor**.
+
+Read minigbm's Intel backend (`i915.c`) to find out why, the same way the AMD investigations read
+`amdgpu.c`: unlike AMD, which registers one combination per Mesa-reported modifier all at *equal*
+priority (making registration order, and therefore query order, the deciding factor on a tie),
+Intel's `i915_add_combinations()` registers combinations at **explicit, different** priorities —
+`metadata_linear` at priority 1, `metadata_x_tiled` at priority 2, and (for this GPU generation,
+not MTL+) `metadata_y_tiled` at priority 3 — for the *same* render+encoder usage, whenever the
+request carries none of `i915.c`'s `linear_mask` bits (`BO_USE_SW_READ_OFTEN`/`WRITE_OFTEN`/etc.).
+Our usage never sets those. `drv_get_combination()`'s tie-break always keeps the *highest* priority
+match, so **Y-tiled unconditionally beats linear on Intel for this exact usage class** — regardless
+of what order Mesa happens to report modifiers in via `eglQueryDmaBufModifiersEXT`. Confirmed by
+dumping the full modifier list: `I915_FORMAT_MOD_Y_TILED` (`0x0100000000000002`,
+`fourcc_mod_code(INTEL, 2)`) was present at index 2, exactly as `i915.c`'s priority rule predicts,
+just not first.
+
+**Fixed by adding vendor-aware selection** to `rgba_modifier_init()`: query `vaQueryVendorString()`
+(already called at daemon startup for logging, so no new dependency) and, when it names Intel,
+search the reported modifier list for `I915_FORMAT_MOD_Y_TILED` specifically (falling back to
+X_TILED, then to index 0) instead of blindly trusting index 0 the way the AMD path still correctly
+does. Confirmed AMD's own behavior is unaffected by re-testing server01 after the change (still
+picks the same modifier as before, vendor string doesn't match "Intel", falls through to the
+original logic unchanged). Deployed to `n02`, killed and let init restart `mediaserver`-equivalent
+codec-list caching wasn't even needed this time — the daemon fix alone was enough, and it applied
+*live* to an already-open `scrcpy` session without reconnecting `adb` or recreating the container,
+since every frame is a fresh request to the daemon. Confirmed: clean, correct picture.
+
+**Tier 5 is now independently confirmed on two different GPU vendors** (AMD Renoir/GFX9 on
+server01, Intel Iris Xe/TigerLake on n02) using the *exact same* unmodified Android vendor image,
+with only a small, host-local daemon differing per machine — real evidence the Tier 5.9
+architecture decision (keep all GPU-specific knowledge in the daemon, never in the Android
+component) was the right one. Polaris/GFX8 remains the one confirmed-blocked case, and now for a
+reason that's clearly its own (no modifier exists at all for that combination), not a symptom of
+the same class of bug either of the two working GPUs needed fixing.
