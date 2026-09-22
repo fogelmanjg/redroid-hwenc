@@ -141,6 +141,11 @@ claim. If you've got other hardware (a different AMD generation, NVIDIA, a diffe
 generation) and want to help fill this in, see Contributing below — a PR against this table with
 your own findings is exactly the kind of contribution this project can use.
 
+**NVIDIA isn't in this table** because it's not this project's Tier 3+ problem yet — `gpuMode=host`
+doesn't boot at all on NVIDIA today (a real gralloc/EGL incompatibility, not a config gap), which
+is a more foundational issue than encode. That work, including what's already been found and ruled
+out, moved to its own repo: [**redroid-nvidia**](https://github.com/fogelmanjg/redroid-nvidia).
+
 ## Contributing
 
 No CLA, no friction — plain Apache-2.0. If this problem interests you, a PR or a comment on an
