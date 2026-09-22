@@ -73,23 +73,35 @@ Each tier assumes the previous one is done. ⭐ marks the highest-leverage check
       from scratch. See `DEVLOG.md` for the full build/deploy story, including three real bugs
       found and fixed along the way (a build-container lifecycle bug, a docker0 bridge networking
       bug, and a missing-shared-library crash loop).
-- [ ] **Tier 5 — Real integration.** Tier 3 + Tier 2 wired into the callbacks of the Tier 4
-      component. The actual goal. **Architecture pivot**: porting Mesa's VA-API driver stack to
-      build against Android's bionic turned out to need a full `radeonsi` + winsys + LLVM port
-      (this build's Mesa only compiles the `gfxstream`/ANGLE/Vulkan forwarding-to-host pieces for
-      Android, no native GPU driver at all) — realistically weeks of work on its own. Pivoted
-      instead to a host-side encode daemon the Android component talks to over a Unix socket,
-      reusing Tier 2/3's pipeline unchanged. Sub-goal 5.2 (the daemon itself) is done — see
-      [tier5-vaapi-daemon/README.md](tier5-vaapi-daemon/README.md).
-- [ ] **Tier 6 (conditional on Tier 0).** If redroid/scrcpy's codec selection turns out to be
-      hardcoded instead of capability-based: patch it.
+- [x] **Tier 5 — ⭐ Real integration.** Tier 3 + Tier 2 wired into the callbacks of the Tier 4
+      component. The actual goal, and it's done. **Architecture pivot**: porting Mesa's VA-API
+      driver stack to build against Android's bionic turned out to need a full `radeonsi` +
+      winsys + LLVM port (this build's Mesa only compiles the `gfxstream`/ANGLE/Vulkan
+      forwarding-to-host pieces for Android, no native GPU driver at all) — realistically weeks of
+      work on its own. Pivoted instead to a host-side encode daemon the Android component talks to
+      over a Unix socket, reusing Tier 2/3's pipeline unchanged — see
+      [tier5-vaapi-daemon/README.md](tier5-vaapi-daemon/README.md). **Confirmed working end to
+      end, on three different GPUs across two vendors** (AMD Renoir, Intel Iris Xe, AMD Polaris —
+      see the hardware compatibility table below): a real, unmodified app (`scrcpy`) records
+      correct, real hardware-encoded H.264 through the genuine `MediaCodec`/`Codec2Client`
+      framework path, visually confirmed correct picture, not just "doesn't crash." Getting there
+      needed real per-GPU work (DCC handling, modifier-aware import, vendor-specific tiling
+      selection, a legacy import path for pre-modifier hardware) — none of it touching the
+      Android-side component, all of it in the host-side daemon. See `DEVLOG.md` for the full
+      story, tier by tier.
+- [x] **Tier 6 (conditional on Tier 0).** If redroid/scrcpy's codec selection turns out to be
+      hardcoded instead of capability-based: patch it. **Turned out unnecessary** — confirmed
+      throughout Tier 5 that selection is genuinely capability-based (`MediaCodecList`/
+      `Codec2InfoBuilder`, the standard AOSP framework mechanism): `scrcpy` picks up
+      `c2.hardware.encoder.h264` automatically once it's correctly registered, with no changes to
+      redroid or scrcpy needed at all.
 
 Even if it doesn't go further, each tier on its own is a publishable contribution — none of this
 has been documented by anyone until now.
 
 ## Current status
 
-Tiers 0-4 done. Codec2 hardware-encode gap root-caused and fixed across AMD/Intel/NVIDIA; a
+Tiers 0-5 done. Codec2 hardware-encode gap root-caused and fixed across AMD/Intel/NVIDIA; a
 standalone VA-API H.264 encoder proven working end to end on real hardware (verified decodable
 output, not just successful API calls); the Tier 3 make-or-break question — whether a dma-buf
 VA-API didn't allocate can be imported and correctly encoded from — confirmed across three real
