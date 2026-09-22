@@ -120,8 +120,13 @@ recompiled locally, never a cross-machine AOSP rebuild. **Confirmed on a second 
 Intel Iris Xe, using the *identical* unmodified vendor image built for AMD — one more real,
 vendor-specific bug (Intel's driver prefers tiled over linear for this usage class, unlike AMD,
 so naively trusting the first modifier the driver reports was silently wrong), fixed the same way,
-in the daemon only. See [DEVLOG.md](DEVLOG.md) for the real
-progress, session by session.
+in the daemon only. **Then confirmed on a third GPU, an older AMD generation this project had
+previously written off as blocked** (Radeon RX 480/Polaris, GFX8): that GPU can't describe its
+tiling as a DRM modifier at all, and a GL-based bridge that seemed to solve it turned out to be a
+Mesa same-process shortcut, not a real fix — the actual answer was simpler than any of that,
+VA-API's own *old*, pre-modifier import path resolves this GPU's opaque tiling correctly even
+across processes, unlike EGL's equivalent. Tier 5 is now 3-for-3 on every GPU this project has
+tried. See [DEVLOG.md](DEVLOG.md) for the real progress, session by session.
 
 ## Hardware compatibility
 
@@ -133,7 +138,7 @@ the full real-app pipeline hasn't been (or can't yet be) run on it.
 | GPU | Architecture | Status | Notes |
 |---|---|---|---|
 | AMD Renoir (Ryzen APU, integrated) | GFX9 | **Tier 5 — full pipeline works** | Reference implementation. Needed `AMD_DEBUG=nodcc` (VCN can't encode DCC-compressed surfaces) and a modifier-aware (`DRM_PRIME_2`) import once a real Surface-sourced buffer turned out to be GPU-tiled. |
-| AMD Radeon RX 480 (Polaris, discrete) | GFX8 | **Blocked before Tier 5** — Tier 3 mechanism confirmed | The real Surface-sourced RGBA buffer imports with `resource allocation failed`: confirmed via a controlled test (a genuinely-linear buffer at the *exact same* stride imports fine) that the real buffer itself isn't linear, yet Mesa reports **zero** DRM format modifiers for this format/GPU/usage combo — minigbm falls back to opaque, non-modifier-describable tiling (`TILE_TYPE_DRI`) that `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2` has no way to express. Tried bridging via plain (non-modifier) `EGL_LINUX_DMA_BUF_EXT` import + a GPU blit into a fresh linear buffer — works when the same process both allocates and re-imports the buffer, but that turned out to be a Mesa same-process shortcut, not genuine opaque-tiling resolution: the real, cross-process case (daemon importing a foreign process's fd, confirmed with a same-process-vs-cross-process side-by-side test) still fails. This specific fix direction is a dead end, not just unimplemented — see DEVLOG for what's left to try. |
+| AMD Radeon RX 480 (Polaris, discrete) | GFX8 | **Tier 5 — full pipeline works** | Mesa reports **zero** DRM format modifiers for this GPU/format/usage combo at all — minigbm falls back to opaque, non-modifier-describable tiling (`TILE_TYPE_DRI`) that `DRM_PRIME_2` has no way to express. A GL-based bridge (import via plain EGL, GPU-blit into a fresh linear buffer) seemed to work but turned out to only resolve the tiling within the *same process* that allocated the buffer — a Mesa shortcut, not a real fix, confirmed broken for the actual cross-process case. The real fix: VA-API's own *old*, pre-modifier import path (`VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME`) resolves this GPU's opaque tiling correctly even across processes, unlike EGL's equivalent — libva is built around cross-process IPC as the normal case to begin with. Confirmed with a real GPU-tiled buffer handed cross-process, then with the real app. |
 | Intel Iris Xe (TigerLake-LP, integrated) | Gen12 | **Tier 5 — full pipeline works** | Same unmodified vendor image as the AMD reference, no rebuild needed. Hit one real vendor-specific bug: this GPU's driver prefers Y-tiled over linear for the real buffer's usage class (confirmed by reading minigbm's `i915.c` — unlike AMD, Intel registers linear/X-tiled/Y-tiled at different explicit priorities, and tiled always wins for this usage when no CPU-read/write hint is set), so blindly trusting the first modifier the driver reports (which happened to work for AMD) silently picked the wrong one. Fixed with vendor-string detection in the daemon. |
 
 This list is 3 machines because that's what's in this project's own reach, not a completeness

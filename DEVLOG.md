@@ -1589,3 +1589,49 @@ architecture decision (keep all GPU-specific knowledge in the daemon, never in t
 component) was the right one. Polaris/GFX8 remains the one confirmed-blocked case, and now for a
 reason that's clearly its own (no modifier exists at all for that combination), not a symptom of
 the same class of bug either of the two working GPUs needed fixing.
+
+## 2026-09-22 (same day) — Tier 5.12: Polaris/GFX8 solved after all — the old VA-API import path, not the GL bridge
+
+Revisited the "confirmed dead end" from the previous entries with a narrower question: EGL's
+plain dma-buf import only resolves Polaris's opaque tiling *within the same process* that
+allocated the buffer — but is that limitation specific to EGL, or does *every* mechanism on this
+driver that tries to import a foreign, unmodified dma-buf share it? VA-API was never actually
+tested this way. `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME` (`VASurfaceAttribExternalBuffers`, the
+*old*, pre-modifier import path this project moved away from back in Tier 5.7, for entirely
+different reasons at the time) has the same "no modifier field, driver has to work it out"
+shape EGL's plain extension does. Worth trying directly rather than assuming it inherits EGL's
+same-process-only limitation, since libva's own API is built around cross-process IPC as the
+ordinary case (client/server over Unix sockets, shared memory, dma-buf handoff between unrelated
+processes) in a way EGL/GL — usually single-process — isn't.
+
+Tested it directly: skip the (already-proven-broken-cross-process) GL bridge entirely, import the
+client's real fd straight into `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME` instead of `DRM_PRIME_2`.
+Sent through the exact same cross-process test that broke the GL bridge (`gbm-render-test-client.c`,
+a separate process allocating a `GBM_BO_USE_RENDERING` buffer and handing its fd to the daemon
+over `SCM_RIGHTS`, precisely matching how a real Android buffer arrives): **`(231, 0, 1)` back —
+correct red, uniform across the whole frame, matching AMD Renoir's own quantization-loss profile
+exactly.** Confirmed against the real pipeline too (real redroid container, `scrcpy`, real
+`Surface`-sourced capture): clean, correct picture.
+
+So the real fix was simpler than anything Tier 5.10 tried, and didn't need GL, GBM buffer
+creation, or a blit pass at all — just picking the *other* pre-existing VA-API import path for
+this one GPU class. Mesa's radeonsi VA-API backend evidently *can* resolve this GPU's opaque
+tiling from a genuinely foreign fd; its EGL implementation apparently can't (or doesn't try to).
+Never actually established *why* those two code paths inside the same driver differ this way —
+worth returning to if a third GPU needing the legacy-import branch shows up and behaves
+differently — but the empirical result across two separate test methodologies (cross-process
+synthetic buffer, then the real app) is unambiguous.
+
+**Removed the entire Tier 5.10 GL-bridge implementation** (`gl_bridge_context_init()`,
+`egl_bridge_convert_to_linear()`, the shader/VBO setup, the `GLES2` dependency) now that it's
+confirmed superseded rather than merely unused — kept as git history and in the DEVLOG entries
+above rather than as dead code sitting in the daemon. `st->needs_egl_bridge` became
+`st->use_legacy_prime`, and `rgba_modifier_init()`'s "zero modifiers" branch now means exactly
+that: use the old import path for this GPU, nothing about GL at all.
+
+**Tier 5 is now confirmed on all three GPUs this project has touched** — AMD Renoir (GFX9), Intel
+Iris Xe (Gen12), and AMD Polaris/RX 480 (GFX8) — each with a real, understood, GPU-specific reason
+for what it needed (DCC disabling + modifier-aware import; vendor-aware tiled-over-linear
+modifier selection; the legacy pre-modifier import path), all living entirely in the host-side
+daemon, none of it touching the Android-side component. The "GPU compatibility" question this
+project set out with has gone from open to, so far, 3-for-3.
