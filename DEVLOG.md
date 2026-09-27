@@ -1635,3 +1635,102 @@ for what it needed (DCC disabling + modifier-aware import; vendor-aware tiled-ov
 modifier selection; the legacy pre-modifier import path), all living entirely in the host-side
 daemon, none of it touching the Android-side component. The "GPU compatibility" question this
 project set out with has gone from open to, so far, 3-for-3.
+
+## 2026-09-27 — Tier 6 kickoff: hardware video decode, a fourth GPU, and NVIDIA's own VA-API shim
+
+New direction: hardware *decode*, not encode - and specifically on NVIDIA, motivated by a sibling
+project ([redroid-nvidia](https://github.com/fogelmanjg/redroid-nvidia), which handles NVIDIA
+encode via NVENC/Venus since VA-API encode doesn't exist on this vendor at all) needing the same
+capability and by having a GTX 1050 Ti (Pascal) available to test against. Decode turns out to be
+architecturally closer to this project's own encode work than NVENC was: `nvidia-vaapi-driver`
+(a real, if community-maintained, VA-API backend by elFarto) exposes H.264/HEVC/VP9 *decode* via
+the exact same VA-API surface this project already speaks for AMD/Intel encode - confirmed with a
+real `vainfo`: `VAProfileH264High`/`Main`/`ConstrainedBaseline` all list `VAEntrypointVLD`. So
+unlike encode, NVIDIA decode doesn't need its own vendor-specific transport at all - it's the
+fourth GPU for the *same* VA-API mechanism, not a fork of it.
+
+**Sanity check before writing anything**: `ffmpeg -hwaccel vaapi` against a real H.264 file,
+decoded via `nvidia-vaapi-driver`, produced a pixel-identical frame to software decode. Real NVDEC
+decode through VA-API genuinely works on this GPU/driver - worth confirming before writing a
+single line of this project's own code, since the alternative (a broken driver) would have made
+everything downstream moot.
+
+**New spike, `tier6-vaapi-decode/main.c`, mirroring Tier 2's own shape and rigor**: standalone,
+no Android/redroid - drives the *decode* side of VA-API end to end on a real Annex-B H.264
+elementary stream this program parses itself (hand-written Exp-Golomb bitreader, SPS/PPS/slice-
+header parsers scoped to exactly what a baseline-profile, CAVLC, single-slice, no-B-frames stream
+needs - matching Tier 2's own "prove the mechanism, not full spec coverage" scope). Decodes exactly
+one frame (the IDR), the decode-side mirror of Tier 2's own single-I-frame encode.
+
+Four real, independent bugs found on the way to a correct decode, each isolated by direct
+evidence rather than assumption:
+
+1. **`vaDeriveImage` failed outright.** `nvidia-vaapi-driver` is built primarily for video
+   *playback* (handing decoded frames straight into EGL/GL for a media player) - a CPU-readback
+   path its own primary use case never needs came back broken. Switched to `vaCreateImage` +
+   `vaGetImage` (an explicit-copy path more backends bother implementing) - this got a result, but
+   a suspicious one: a flat, perfectly uniform image, split cleanly in half (row 256) between two
+   different constant values (128, then 16), not real content and not noise either.
+
+2. **The decode surface has a real, non-zero DRM format modifier - tiled, not linear -
+   confirmed via `vaExportSurfaceHandle` + a raw `mmap`, the exact method redroid-nvidia's own
+   NVENC investigation used for the mirror-image problem.** Reading tiled memory with a plain
+   linear pitch produces exactly this "large uniform bands" shape, not noise, because a coarse
+   tiling granularity makes broad uniform regions the natural failure mode. Tried requesting
+   `DRM_FORMAT_MOD_LINEAR` explicitly via `VASurfaceAttribDRMFormatModifiers` at surface creation,
+   and via a VA-API `VAEntrypointVideoProc` blit to a second "linear" surface - **both ignored the
+   request and came back with the identical non-zero modifier anyway** (`0x3000000004fe014`, the
+   same NVIDIA block-linear family redroid-nvidia's own investigation already characterized).
+   Concluded NVDEC's own hardware decode target genuinely can't be linear on this GPU, full stop -
+   matching how real playback pipelines never read a decode target's raw memory either. Fixed by
+   reusing redroid-nvidia's own proven technique instead of fighting the driver: import the tiled
+   dma-buf into Vulkan with its real, exported modifier (probing the real per-modifier layout via
+   `vkGetImageSubresourceLayout`, not trusting any reported pitch), `vkCmdCopyImage` into a
+   genuinely `VK_IMAGE_TILING_LINEAR` destination, map that instead. One real wrinkle Tier 7 hadn't
+   hit: the probe image's own computed memory *size* didn't match the real dma-buf object's actual
+   size (the object was allocated by the decoder's own internal logic, with different usage flags
+   than a fresh probe image) - `vkAllocateMemory` for the *import* has to use the dma-buf's own
+   reported size, not the probe's.
+
+3. **Still identical, byte-for-byte, after fixing the tiling.** The real bug was elsewhere, and
+   this fix - while correct, and worth keeping - was chasing a symptom. Filled in the slice
+   header parser fully (through `slice_qp_delta` and the deblocking-filter fields, not just the
+   handful of values this program's own code needed) to compute `slice_data_bit_offset`, a real
+   required `VASliceParameterBufferH264` field this spike's first version left at its zeroed
+   default entirely. Needed a second small function, `escaped_bit_offset()`, to translate a bit
+   position from the de-escaped RBSP (what the header parser reads) back into the original,
+   still-escaped bitstream (what VA-API's own field is defined against) - not a 1:1 mapping
+   whenever an emulation-prevention byte falls before that point.
+
+4. **Still identical, byte-for-byte, a second time - the real cause, found by reading
+   `nvidia-vaapi-driver`'s own source (cloned from GitHub) rather than guessing further.**
+   `NVD_LOG=1 NVD_LOG_VERBOSE=1` (found by `strings`-ing the driver binary for env var names,
+   undocumented) showed detailed internal tracing right up to context creation, then nothing at
+   all between "Creating decoder" and this program's own "decode submitted" print - no mention of
+   H264, slices, or `cuvidDecodePicture` anywhere, despite `vaEndPicture` reporting success. Traced
+   `nvEndPicture()`/`h264.c` in the driver's own source: it reconstructs the bitstream it hands to
+   real NVDEC (`cuvidDecodePicture`) by prepending its *own* `00 00 01` start code directly in
+   front of whatever bytes `VASliceDataBufferType` provided, then lets CUVID parse the NAL header
+   itself from that. This spike's own `NalUnit.data`/`size` deliberately exclude the 1-byte NAL
+   header everywhere else in the program (it's already been parsed out into
+   `nal_unit_type`/`nal_ref_idc` separately) - which meant the slice data buffer handed to VA-API
+   was missing that byte, so the driver's reconstructed bitstream had a real slice-header bit
+   (part of `first_mb_in_slice`'s own coding) sitting exactly where a NAL header byte should be.
+   CUVID's own internal parser would derive a bogus `nal_unit_type` from that and never decode
+   anything real - silently, no error, explaining every identical-output symptom above. **Not an
+   NVIDIA-specific bug** - "slice data excludes the start code but includes the NAL header byte"
+   is the standard VA-API convention every backend expects; this spike's own extraction helper
+   just built the wrong slice than convention up front. Fixed by pointing the slice data buffer
+   one byte earlier (`idr_nal->data - 1`, size `+ 1`) - net two-line fix once identified.
+
+**Result: real, recognizable decoded content** - the test pattern's color bars, circle, and
+gradient all visible and correctly positioned, confirmed against software decode with
+`ffmpeg`'s own PSNR filter: **luma is pixel-perfect (`PSNR y:inf`)**, chroma is off
+(`u:10.2 v:10.1`, visible as a washed-out/ghosted color look layered over otherwise-correct
+structure). Luma being exact confirms the hard part - real CAVLC entropy decoding and macroblock
+reconstruction via actual NVDEC hardware - is genuinely correct end to end; the remaining chroma
+issue is isolated to that one plane specifically (it uses a different tiling `rowPitch` than luma,
+1280 vs 640, and/or a U/V channel order assumption reading the `GR88`-format plane) rather than
+being a sign of a deeper problem. **Next session**: fix the isolated chroma read, then decide
+whether to fold this into the existing `tier5-vaapi-daemon` architecture as NVIDIA's fourth
+supported GPU family or keep it as this project's first dedicated *decode* daemon variant.
