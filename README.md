@@ -189,14 +189,27 @@ the full real-app pipeline hasn't been (or can't yet be) run on it.
 | Intel Iris Xe (TigerLake-LP, integrated) | Gen12 | **Tier 5 — full pipeline works** | Same unmodified vendor image as the AMD reference, no rebuild needed. Hit one real vendor-specific bug: this GPU's driver prefers Y-tiled over linear for the real buffer's usage class (confirmed by reading minigbm's `i915.c` — unlike AMD, Intel registers linear/X-tiled/Y-tiled at different explicit priorities, and tiled always wins for this usage when no CPU-read/write hint is set), so blindly trusting the first modifier the driver reports (which happened to work for AMD) silently picked the wrong one. Fixed with vendor-string detection in the daemon. |
 
 This list is 3 machines because that's what's in this project's own reach, not a completeness
-claim. If you've got other hardware (a different AMD generation, NVIDIA, a different Intel
-generation) and want to help fill this in, see Contributing below — a PR against this table with
-your own findings is exactly the kind of contribution this project can use.
+claim. If you've got other hardware (a different AMD generation, a different Intel generation)
+and want to help fill this in, see Contributing below — a PR against this table with your own
+findings is exactly the kind of contribution this project can use.
 
-**NVIDIA isn't in this table** because it's not this project's Tier 3+ problem yet — `gpuMode=host`
-doesn't boot at all on NVIDIA today (a real gralloc/EGL incompatibility, not a config gap), which
-is a more foundational issue than encode. That work, including what's already been found and ruled
-out, moved to its own repo: [**redroid-nvidia**](https://github.com/fogelmanjg/redroid-nvidia).
+### Decode (Tier 7, NVIDIA)
+
+A separate table on purpose — decode is a different pipeline (`tier5-vaapi-daemon`'s own decode
+backend, `nvidia-vaapi-driver`/NVDEC via VA-API) from the encode table above, and currently
+NVIDIA-only (see "NVIDIA isn't in this table" below for why encode is a different story).
+
+| GPU | Architecture | Status | Notes |
+|---|---|---|---|
+| GTX 1050 Ti | Pascal | **Confirmed bit-exact** | The Tier 7 reference hardware — see the roadmap entry and `DEVLOG.md`'s 2026-09-27 entries. Standalone spike and the full daemon/Codec2 integration both verified against software decode via PSNR (`y:inf u:inf v:inf average:inf`), not just visually correct. |
+| RTX 4060 | Ada Lovelace | **Assumed working, not yet confirmed** | Blocked on a separate, currently-under-investigation driver issue on this GPU (unrelated to this project's own decode code — see [redroid-nvidia](https://github.com/fogelmanjg/redroid-nvidia)'s own DEVLOG for that investigation). Assuming this resolves rather than being a real Ada-specific decode blocker, since decode goes through the same `nvidia-vaapi-driver`/VA-API mechanism on both GPUs — but per this project's own "real results, not speculation" standard, treat this row as **unverified** until it's actually run and PSNR-checked here, the same way Pascal was. |
+
+**NVIDIA isn't in the encode table above** because encode is a different problem for this GPU
+entirely — `gpuMode=host` doesn't boot at all on NVIDIA today (a real gralloc/EGL incompatibility,
+not a config gap), which is more foundational than encode itself. That work, including what's
+already been found and ruled out, moved to its own repo:
+[**redroid-nvidia**](https://github.com/fogelmanjg/redroid-nvidia). Decode doesn't share that
+blocker (see the table above) — it doesn't need `gpuMode=host` at all.
 
 ## Contributing
 
