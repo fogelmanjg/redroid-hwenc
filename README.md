@@ -202,14 +202,23 @@ NVIDIA-only (see "NVIDIA isn't in this table" below for why encode is a differen
 | GPU | Architecture | Status | Notes |
 |---|---|---|---|
 | GTX 1050 Ti | Pascal | **Confirmed bit-exact** | The Tier 7 reference hardware — see the roadmap entry and `DEVLOG.md`'s 2026-09-27 entries. Standalone spike and the full daemon/Codec2 integration both verified against software decode via PSNR (`y:inf u:inf v:inf average:inf`), not just visually correct. |
-| RTX 4060 | Ada Lovelace | **Assumed working, not yet confirmed** | Blocked on a separate, currently-under-investigation driver issue on this GPU (unrelated to this project's own decode code — see [redroid-nvidia](https://github.com/fogelmanjg/redroid-nvidia)'s own DEVLOG for that investigation). Assuming this resolves rather than being a real Ada-specific decode blocker, since decode goes through the same `nvidia-vaapi-driver`/VA-API mechanism on both GPUs — but per this project's own "real results, not speculation" standard, treat this row as **unverified** until it's actually run and PSNR-checked here, the same way Pascal was. |
+| RTX 4060 | Ada Lovelace | **Not yet run through this project's own decode path** | This project's own VA-API decode code hasn't actually been exercised on this GPU yet — the two-GPU confirmation above is for redroid-nvidia's own 3D acceleration/NVENC work (see below), a separate pipeline. Reasonable to assume this works too, since decode goes through the same `nvidia-vaapi-driver`/VA-API mechanism on both GPUs and that mechanism doesn't touch the specific driver-level limitation found on this card (see below) — but per this project's own "real results, not speculation" standard, treat this row as **unverified** until it's actually run and PSNR-checked here, the same way Pascal was. |
 
-**NVIDIA isn't in the encode table above** because encode is a different problem for this GPU
-entirely — `gpuMode=host` doesn't boot at all on NVIDIA today (a real gralloc/EGL incompatibility,
-not a config gap), which is more foundational than encode itself. That work, including what's
-already been found and ruled out, moved to its own repo:
-[**redroid-nvidia**](https://github.com/fogelmanjg/redroid-nvidia). Decode doesn't share that
-blocker (see the table above) — it doesn't need `gpuMode=host` at all.
+**NVIDIA isn't in the encode table above** because this project's own VA-API encode mechanism
+doesn't apply to NVIDIA at all — `nvidia-vaapi-driver` is decode-only (`vainfo` lists zero
+`VAEntrypointEncSlice` entries), not a matter of this GPU needing more work to catch up to
+AMD/Intel here. That said, NVIDIA is **not** stuck without acceleration or encode overall: the
+sibling project, [**redroid-nvidia**](https://github.com/fogelmanjg/redroid-nvidia), built its own
+path to both — a custom Venus-proxy 3D acceleration pipeline (bypassing the still-broken native
+`gpuMode=host`/Mesa-GBM path entirely) confirmed booting to a real, rendered Android home screen
+with real GPU acceleration on **both** a GTX 1050 Ti and an RTX 4060, and real hardware video
+encode via NVENC (a different mechanism from this project's VA-API daemon, since NVIDIA doesn't
+expose encode through VA-API) confirmed producing correct, decodable H.264 on both GPUs too. One
+open item there as of 2026-09-27: a low-severity scanline-dropout artifact on the RTX 4060
+specifically, root-caused to a real driver-level limitation (a "prime fence" import failure) in
+driver 595.91.07 on Ada Lovelace — confirmed absent on the same 1050 Ti with an older driver, and
+confirmed to also affect Android's own compositor independent of NVENC, so it's a driver gap, not
+a bug in either project's own code. See that repo's own README/DEVLOG for the full trail.
 
 ## Contributing
 
