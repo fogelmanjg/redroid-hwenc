@@ -23,6 +23,12 @@
  * real Android gralloc buffer in Tier 5.4) instead of returning
  * C2_NOT_FOUND.
  *
+ * Tier 7 added a second component, c2.hardware.decoder.h264
+ * (VaapiDecComponent), backed by the same daemon's new decode command
+ * (NVIDIA VA-API decode, decode_h264.c) - one IComponentStore, two
+ * components, dispatched by name exactly like a real multi-codec vendor
+ * store would.
+ *
  * Adapted from AOSP's official empty-service template at
  * frameworks/av/media/codec2/hal/services/vendor.cpp (its own header says:
  * "make a copy of this whole directory and rename modules accordingly" --
@@ -48,6 +54,7 @@
 #include <codec2/aidl/ParamTypes.h>
 
 #include "VaapiEncComponent.h"
+#include "VaapiDecComponent.h"
 
 // This is the absolute on-device path of the prebuilt_etc module
 // "android.hardware.media.c2-vaapi-seccomp_policy" in Android.bp.
@@ -81,37 +88,58 @@ public:
     virtual c2_status_t createComponent(
             C2String name,
             std::shared_ptr<C2Component>* const component) override {
-        if (name != "c2.hardware.encoder.h264") {
-            return C2_NOT_FOUND;
+        if (name == "c2.hardware.encoder.h264") {
+            auto intf = std::make_shared<android::VaapiEncInterface>(mReflectorHelper);
+            *component = std::make_shared<android::VaapiEncComponent>(name.c_str(), mNextId++, intf);
+            return C2_OK;
         }
-        auto intf = std::make_shared<android::VaapiEncInterface>(mReflectorHelper);
-        *component = std::make_shared<android::VaapiEncComponent>(name.c_str(), mNextId++, intf);
-        return C2_OK;
+        if (name == "c2.hardware.decoder.h264") {
+            auto intf = std::make_shared<android::VaapiDecInterface>(mReflectorHelper);
+            *component = std::make_shared<android::VaapiDecComponent>(name.c_str(), mNextId++, intf);
+            return C2_OK;
+        }
+        return C2_NOT_FOUND;
     }
 
     virtual c2_status_t createInterface(
             C2String name,
             std::shared_ptr<C2ComponentInterface>* const interface) override {
-        if (name != "c2.hardware.encoder.h264") {
-            return C2_NOT_FOUND;
+        if (name == "c2.hardware.encoder.h264") {
+            auto intf = std::make_shared<android::VaapiEncInterface>(mReflectorHelper);
+            *interface = std::make_shared<
+                    android::SimpleInterface<android::VaapiEncInterface>>(
+                    name.c_str(), mNextId++, intf);
+            return C2_OK;
         }
-        auto intf = std::make_shared<android::VaapiEncInterface>(mReflectorHelper);
-        *interface = std::make_shared<
-                android::SimpleInterface<android::VaapiEncInterface>>(
-                name.c_str(), mNextId++, intf);
-        return C2_OK;
+        if (name == "c2.hardware.decoder.h264") {
+            auto intf = std::make_shared<android::VaapiDecInterface>(mReflectorHelper);
+            *interface = std::make_shared<
+                    android::SimpleInterface<android::VaapiDecInterface>>(
+                    name.c_str(), mNextId++, intf);
+            return C2_OK;
+        }
+        return C2_NOT_FOUND;
     }
 
     virtual std::vector<std::shared_ptr<const C2Component::Traits>>
             listComponents() override {
-        auto traits = std::make_shared<C2Component::Traits>();
-        traits->name = "c2.hardware.encoder.h264";
-        traits->domain = C2Component::DOMAIN_VIDEO;
-        traits->kind = C2Component::KIND_ENCODER;
-        traits->rank = 1; // lower than the stock software encoder's rank -- prefer this one
-        traits->mediaType = "video/avc";
-        traits->owner = "vaapi";
-        return {traits};
+        auto encTraits = std::make_shared<C2Component::Traits>();
+        encTraits->name = "c2.hardware.encoder.h264";
+        encTraits->domain = C2Component::DOMAIN_VIDEO;
+        encTraits->kind = C2Component::KIND_ENCODER;
+        encTraits->rank = 1; // lower than the stock software encoder's rank -- prefer this one
+        encTraits->mediaType = "video/avc";
+        encTraits->owner = "vaapi";
+
+        auto decTraits = std::make_shared<C2Component::Traits>();
+        decTraits->name = "c2.hardware.decoder.h264";
+        decTraits->domain = C2Component::DOMAIN_VIDEO;
+        decTraits->kind = C2Component::KIND_DECODER;
+        decTraits->rank = 1; // lower than the stock software decoder's rank -- prefer this one
+        decTraits->mediaType = "video/avc";
+        decTraits->owner = "vaapi";
+
+        return {encTraits, decTraits};
     }
 
     virtual c2_status_t copyBuffer(

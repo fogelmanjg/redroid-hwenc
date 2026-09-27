@@ -1782,3 +1782,108 @@ supported decode path (the daemon already has the SCM_RIGHTS transport and per-v
 shape this needs), then the Codec2-side wiring - a real decoder component (input=compressed
 bitstream via `C2LinearBlock`, output=decoded frame via `C2GraphicBlock` from a `BlockPool`) is
 new work in either project, since neither has one yet.
+
+## 2026-09-27 (same day, continued) — Tier 7 lands: decode in the daemon, a real Codec2 decoder, proven end to end
+
+Closed out the two things Tier 7's own spike left open: folding decode into `tier5-vaapi-daemon`'s
+persistent multi-vendor process, and writing the actual `c2.hardware.decoder.h264` Codec2
+component. Both done, both proven on real hardware in the same session - not just "builds clean".
+
+**Porting the spike into `decode_h264.c`.** The spike (`tier6-vaapi-decode/main.c`) was a one-shot
+CLI: parse one file, decode one frame, exit. The daemon needs persistent-state functions it can
+call once per request - `decode_h264_init()` (opens the DRM device, `vaInitialize`s, builds the
+VA-API config, initializes Vulkan once) and `decode_h264_frame()` (per-request: parse, decode,
+de-tile, return bytes), mirroring the shape `vaapi_state_t`/`encode_one_frame()` already use for
+encode, including a `decode_ensure_resolution()` that only tears down and recreates VA-API
+surfaces/contexts when the incoming stream's own SPS reports a size change - not on every call.
+
+One API design choice worth recording: `decode_h264_frame()` takes the *whole* buffer handed over
+the wire (potentially containing SPS, PPS, and the IDR slice together, exactly how a Codec2 client
+would hand over a keyframe access unit) and does its own NAL splitting/parsing internally, rather
+than requiring the caller to pre-extract a single NAL like the spike's own `main()` did. Width and
+height are never trusted from the caller either - they're read out of the SPS itself (the only
+authoritative source) and handed back to the caller, so a stale hint on the wire can't silently
+produce a wrong-sized decode.
+
+**The `LIBVA_DRIVER_NAME` problem.** `nvidia-vaapi-driver` isn't something libva's own driver
+auto-detection resolves to for an NVIDIA render node by itself (the standalone spike always needed
+`LIBVA_DRIVER_NAME=nvidia` set explicitly on its own command line for this reason) - but this
+daemon may *also* call `vaInitialize()` for the existing AMD/Intel encode path in the very same
+process, on a host that has both kinds of GPU. Scoped the env var to just `decode_h264_init()`'s
+own call: save whatever `LIBVA_DRIVER_NAME` was already set to, force it to `nvidia`, call
+`vaInitialize`, put the old value back (or unset it if there wasn't one) immediately after -
+regardless of which of the two init calls `main()` happens to run first.
+
+**Both backends are now optional, independently.** Before this, `vaapi_state_init()` failing (no
+AMD/Intel encode entrypoint on this GPU) was fatal - `main()` just returned 1. That's wrong once a
+host can be decode-only (Tier 7's own dev host, jgustavo47, is a GTX 1050 Ti with no AMD/Intel GPU
+at all) or encode-only (every existing production host). `main()` now tracks `have_encode`/
+`have_decode` independently, warns but keeps running if either one is missing, and only refuses to
+start if *neither* backend is available. `handle_encode()`/`handle_decode()` each check their own
+flag and reject cleanly (a normal error response, not a crash) if their backend never initialized.
+
+**Protocol: one tag, two shapes.** Every new connection now starts with a plain 4-byte
+`VaapiCommand` tag (`VAAPI_CMD_ENCODE`/`VAAPI_CMD_DECODE`), read via a plain `read()` before either
+command's own request struct - `handle_connection()` dispatches on it. Decode's own wire shape is
+simpler than encode's: no SCM_RIGHTS at all, just a `DecodeRequest` header followed by exactly
+`bitstream_size` bytes of Annex-B H.264 on the way in, and a `DecodeResponse` header followed by
+tightly-packed NV12 bytes on the way back - deliberately mirroring encode's own "daemon returns
+plain bytes, caller copies them" convention (`VaapiEncComponent::encodeViaDaemon()`) rather than a
+zero-copy-into-a-client-buffer scheme, since the former was already proven and the latter wasn't.
+This breaks wire compatibility with any pre-tag client - both existing call sites
+(`test-client.c`, `VaapiEncComponent.cpp`) were updated in the same change to send
+`VAAPI_CMD_ENCODE` first, and a new `decode-test-client.c` was written as decode's own standalone
+checkpoint, matching the project's own "prove it in isolation before touching Codec2" convention.
+
+**The Codec2 decoder component.** `VaapiDecComponent` is the structural mirror of
+`VaapiEncComponent`: same `SimpleC2Component` base (its fully-synchronous `process(work, pool)`
+contract fits this daemon's blocking request/response model directly, same reasoning as the
+encoder's own header comment), registered as `c2.hardware.decoder.h264`, `KIND_DECODER`. Reading a
+real production decoder in the same AOSP tree (`C2SoftAvcDec`, `frameworks/av/media/codec2/
+components/avc/`) first paid off in two ways beyond just copying its shape:
+
+1. Its interface makes `C2StreamPictureSizeInfo` an `::output` param (not `::input` - the decoder
+   determines picture size from the bitstream, not something a client configures going in) and
+   `C2StreamProfileLevelInfo` an `::input` param (the reverse of the encoder's own interface,
+   where profile/level are something *this component* produces, not receives).
+2. `C2SoftVpxDec::outputBuffer()` showed the right way to copy a *foreign* decoder's own output
+   buffer into a `C2GraphicView`: never assume a particular stride or planar-vs-semiplanar
+   arrangement, always walk `C2PlanarLayout`'s own `rowInc`/`colInc` per plane. `VaapiDecComponent`
+   uses the same technique for the daemon's tightly-packed NV12 into whatever
+   `HAL_PIXEL_FORMAT_YV12` actually gralloc-allocates as on this stack - generalized slightly
+   further (a `colInc`-aware inner loop for the interleaved chroma pair) since YV12's own two
+   chroma planes are never semi-planar, but a future NV12-capable allocation might be.
+
+**Verified twice, on two different real hosts, in the same session:**
+- **jgustavo47 (GTX 1050 Ti, decode-only host):** `daemon.c` correctly found no AMD/Intel encode
+  entrypoint, disabled encode, and initialized decode against `nvidia-vaapi-driver`. Ran the daemon
+  for real, ran `decode-test-client.c` against it over the real Unix socket (not a direct function
+  call) with a fresh `ffmpeg`-generated test stream, and got the frame back: `ffmpeg`'s own PSNR
+  filter against a software-decoded reference frame came back `y:inf u:inf v:inf average:inf` -
+  bit-exact, through the daemon and the new tag/dispatch protocol, not just in the standalone spike.
+- **jgustavo-server01 (Radeon Vega/Renoir APU, encode-capable host):** confirmed the *other* half
+  of the dual-init design on a real second host - encode initialized correctly
+  (`VAEntrypointEncSlice` found), decode failed cleanly (no `nvidia-vaapi-driver` package on this
+  host) without taking the daemon down, and the daemon kept serving encode requests. The
+  `VAAPI_CMD_ENCODE` tag round-tripped correctly - the daemon logged the exact request fields
+  `test-client.c` sent (`320x240, stride_y=512 ...`), proving the new dispatch layer passes bytes
+  through intact. The encode itself then failed inside `encode_one_frame()`'s own dma-buf import
+  ("resource allocation failed") - a pre-existing gap, not a regression from this change:
+  `test-client.c` still hands over a genuinely linear synthetic DRM dumb buffer (unchanged since
+  Tier 5.2), while the daemon has required a real GPU-tiled modifier for every RGBA import since
+  Tier 5.9's `rgba_modifier_init()` - the test client was already stale for that reason before this
+  session touched it, and fixing it is unrelated to the protocol/decode work done here.
+
+Both the AOSP-side build (`libvaapi_codec2_component`, `android.hardware.media.c2-vaapi-service`,
+both arm64/x86_64 and their 32-bit variants) and the plain-`gcc` daemon build went through clean on
+the first real attempt after the port - the persistent-state restructuring and the interface
+design choices modeled closely enough on working reference code (encode's own daemon shape,
+`C2SoftAvcDec`/`C2SoftVpxDec`) that no new bugs showed up in this pass, unlike Tier 6/7's own
+six-bug trail.
+
+**Next**: the actual real-device test - driving `VaapiDecComponent` through the real Codec2/
+`MediaCodec` framework path (not just the daemon standalone), the way this project's encode side
+was eventually proven against a real `Surface`-fed `GraphicBufferSource`. Needs a real H.264-
+containing video source and something to drive a decoder component with it; `tier5-vaapi-daemon/
+codec2-component/component_test.cpp`/`client_test.cpp` are the encode-side precedents to model a
+decode-side equivalent on.

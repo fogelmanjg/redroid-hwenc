@@ -80,6 +80,15 @@ int main(void) {
         return 1;
     }
 
+    /* Tier 7: every connection now starts with a 4-byte command tag, read by
+     * the daemon via a plain read() before it touches either command's own
+     * request struct - see protocol.h's own top comment. */
+    VaapiCommand cmd = VAAPI_CMD_ENCODE;
+    if (write(sock_fd, &cmd, sizeof(cmd)) != (ssize_t)sizeof(cmd)) {
+        perror("write(command tag)");
+        return 1;
+    }
+
     EncodeRequest req = {
         .width = WIDTH,
         .height = HEIGHT,

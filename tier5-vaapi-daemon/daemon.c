@@ -38,6 +38,7 @@
 #include <EGL/eglext.h>
 
 #include "protocol.h"
+#include "decode_h264.h"
 
 #define DRM_RENDER_DEVICE "/dev/dri/renderD128"
 
@@ -739,6 +740,9 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
 
 /* ------------------------------------------------------------------ *
  * Socket server: one connection = one request/response, per protocol.h.
+ * Tier 7 added a second command (decode) dispatched by a 4-byte tag read
+ * before either command's own request struct - see protocol.h's own top
+ * comment and handle_connection() below.
  * ------------------------------------------------------------------ */
 static int recv_request(int conn_fd, EncodeRequest *req, int *out_dmabuf_fd) {
     char cmsg_buf[CMSG_SPACE(sizeof(int))];
@@ -776,10 +780,16 @@ static void send_response(int conn_fd, int32_t status, const unsigned char *buf,
     }
 }
 
-static void handle_connection(vaapi_state_t *st, int conn_fd) {
+static void handle_encode(vaapi_state_t *st, int have_encode, int conn_fd) {
     EncodeRequest req;
     int dmabuf_fd = -1;
     if (recv_request(conn_fd, &req, &dmabuf_fd) != 0) {
+        send_response(conn_fd, -1, NULL, 0);
+        return;
+    }
+    if (!have_encode) {
+        fprintf(stderr, "handle_encode: no AMD/Intel VA-API encode on this host, rejecting\n");
+        close(dmabuf_fd);
         send_response(conn_fd, -1, NULL, 0);
         return;
     }
@@ -800,6 +810,102 @@ static void handle_connection(vaapi_state_t *st, int conn_fd) {
     }
 }
 
+static void send_decode_response(int conn_fd, int32_t status, const uint8_t *buf, uint32_t size) {
+    DecodeResponse resp = {.status = status, .frame_size = (status == 0) ? size : 0};
+    if (write(conn_fd, &resp, sizeof(resp)) != (ssize_t)sizeof(resp)) {
+        perror("write(decode response header)");
+        return;
+    }
+    if (status == 0 && size > 0) {
+        if (write(conn_fd, buf, size) != (ssize_t)size) perror("write(decode response body)");
+    }
+}
+
+/* Bitstream size cap: a sanity bound on untrusted client input (this is a
+ * real system boundary - the Codec2 component runs Android-side), not a
+ * real protocol limit. 32MiB is far beyond any single-picture Annex-B
+ * buffer this project's own scope (baseline profile, one slice, no B-
+ * frames) would ever produce. */
+#define DECODE_MAX_BITSTREAM_SIZE (32u * 1024 * 1024)
+
+static void handle_decode(int have_decode, int conn_fd) {
+    DecodeRequest req;
+    ssize_t n = read(conn_fd, &req, sizeof(req));
+    if (n != (ssize_t)sizeof(req)) {
+        if (n < 0) perror("read(DecodeRequest)");
+        else fprintf(stderr, "read(DecodeRequest): short read (%zd of %zu bytes)\n", n, sizeof(req));
+        send_decode_response(conn_fd, -1, NULL, 0);
+        return;
+    }
+    if (req.bitstream_size == 0 || req.bitstream_size > DECODE_MAX_BITSTREAM_SIZE) {
+        fprintf(stderr, "handle_decode: bad bitstream_size %u\n", req.bitstream_size);
+        send_decode_response(conn_fd, -1, NULL, 0);
+        return;
+    }
+
+    unsigned char *bitstream = malloc(req.bitstream_size);
+    size_t got = 0;
+    while (got < req.bitstream_size) {
+        ssize_t r = read(conn_fd, bitstream + got, req.bitstream_size - got);
+        if (r <= 0) {
+            perror("read(bitstream)");
+            free(bitstream);
+            send_decode_response(conn_fd, -1, NULL, 0);
+            return;
+        }
+        got += (size_t)r;
+    }
+
+    if (!have_decode) {
+        fprintf(stderr, "handle_decode: no NVIDIA VA-API decode on this host, rejecting\n");
+        free(bitstream);
+        send_decode_response(conn_fd, -1, NULL, 0);
+        return;
+    }
+
+    fprintf(stderr, "Decode request: %ux%u hint, %u bytes bitstream\n", req.width, req.height,
+            req.bitstream_size);
+
+    const uint8_t *out_data;
+    size_t out_size;
+    uint32_t out_width, out_height;
+    int rc = decode_h264_frame(bitstream, req.bitstream_size, &out_data, &out_size, &out_width,
+                               &out_height);
+    free(bitstream);
+    if (rc != 0) {
+        send_decode_response(conn_fd, -1, NULL, 0);
+        return;
+    }
+    if (out_width != req.width || out_height != req.height) {
+        fprintf(stderr,
+                "handle_decode: warning: SPS resolution %ux%u doesn't match request's %ux%u hint\n",
+                out_width, out_height, req.width, req.height);
+    }
+    fprintf(stderr, "Decoded %ux%u, %zu bytes NV12\n", out_width, out_height, out_size);
+    send_decode_response(conn_fd, 0, out_data, (uint32_t)out_size);
+}
+
+static void handle_connection(vaapi_state_t *st, int have_encode, int have_decode, int conn_fd) {
+    VaapiCommand cmd;
+    ssize_t n = read(conn_fd, &cmd, sizeof(cmd));
+    if (n != (ssize_t)sizeof(cmd)) {
+        if (n < 0) perror("read(command tag)");
+        else fprintf(stderr, "read(command tag): short read (%zd of %zu bytes)\n", n, sizeof(cmd));
+        return;
+    }
+    switch (cmd) {
+    case VAAPI_CMD_ENCODE:
+        handle_encode(st, have_encode, conn_fd);
+        break;
+    case VAAPI_CMD_DECODE:
+        handle_decode(have_decode, conn_fd);
+        break;
+    default:
+        fprintf(stderr, "handle_connection: unknown command tag %d\n", (int)cmd);
+        break;
+    }
+}
+
 int main(void) {
     setvbuf(stderr, NULL, _IONBF, 0);
 
@@ -807,8 +913,26 @@ int main(void) {
      * included) -- see rgba_modifier_init()'s comment for why. */
     setenv("AMD_DEBUG", "nodcc", 1);
 
+    /* Encode (AMD/Intel) and decode (NVIDIA) are independent, optional
+     * backends - a host may have either, both (two different GPUs, two
+     * different render nodes down the line), or neither yet. Tier 7's own
+     * dev host (jgustavo47, a GTX 1050 Ti with no AMD/Intel GPU at all) is
+     * decode-only; existing production hosts stay encode-only. Neither
+     * init failing is fatal by itself - only both together mean this
+     * daemon has nothing to actually do. */
     vaapi_state_t st;
-    if (vaapi_state_init(&st) != 0) return 1;
+    int have_encode = (vaapi_state_init(&st) == 0);
+    if (!have_encode) {
+        fprintf(stderr, "No AMD/Intel VA-API encode on this host - encode requests will be rejected\n");
+    }
+    int have_decode = (decode_h264_init() == 0);
+    if (!have_decode) {
+        fprintf(stderr, "No NVIDIA VA-API decode on this host - decode requests will be rejected\n");
+    }
+    if (!have_encode && !have_decode) {
+        fprintf(stderr, "Neither encode nor decode available on this host - nothing to do\n");
+        return 1;
+    }
 
     /* Parent directory is the shared bind-mount point between this host
      * process and the redroid container (see README.md) -- created here
@@ -842,7 +966,7 @@ int main(void) {
             perror("accept");
             break;
         }
-        handle_connection(&st, conn_fd);
+        handle_connection(&st, have_encode, have_decode, conn_fd);
         close(conn_fd);
     }
 

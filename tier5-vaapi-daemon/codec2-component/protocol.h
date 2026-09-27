@@ -1,6 +1,6 @@
 /*
- * Wire protocol between the Codec2 component running inside Android
- * (bionic) and this VA-API encode daemon running on the host (glibc).
+ * Wire protocol between the Codec2 components running inside Android
+ * (bionic) and this VA-API daemon running on the host (glibc).
  *
  * Why this exists at all: porting Mesa's radeonsi Gallium driver (+ the
  * LLVM shader compiler it needs) to build against bionic turned out to be
@@ -24,6 +24,37 @@
  *
  * Response: EncodeResponse header, then (if status == 0) exactly
  * `coded_size` bytes of Annex-B H.264.
+ *
+ * Tier 7 added a second command, decode, on the same socket/connection
+ * shape (one connection = one request/response) but a simpler wire shape
+ * of its own: every byte flows as plain stream data, no SCM_RIGHTS at all
+ * in either direction. The daemon's own persistent VA-API decode surface
+ * is driver-allocated (there's no client dma-buf to import on the way
+ * in), and - unlike encode's real hardware-tiled output, which stays on
+ * the GPU as a coded bitstream - a decoded NV12 frame is small enough,
+ * and this project's existing convention already asks for it (see
+ * VaapiEncComponent's own encodeViaDaemon()/process(): the daemon returns
+ * plain bytes, the component copies them into its own output block), that
+ * doing the same for decode's output keeps this new code path consistent
+ * with the encode path already proven end to end, rather than adding a
+ * new, less-tested zero-copy-into-a-client-buffer scheme up front.
+ *
+ * Every new connection sends a 4-byte VaapiCommand tag FIRST (a plain
+ * write()/read(), before any encode-specific sendmsg()/recvmsg()), so the
+ * daemon can dispatch before touching either request struct - existing
+ * encode clients (this repo's own test-client.c and
+ * VaapiEncComponent.cpp) were updated to send VAAPI_CMD_ENCODE first;
+ * anything predating this tag would desync the protocol entirely, so
+ * there's no backward-compatible "old" framing to preserve.
+ *
+ * Decode request: VaapiCommand tag, then a DecodeRequest header, then
+ * exactly `bitstream_size` bytes of Annex-B H.264 - the real NAL unit as
+ * it appears in the stream (start code excluded, but - a real bug
+ * tier6-vaapi-decode's own README documents in detail - the NAL's own
+ * 1-byte header INCLUDED, not just the RBSP payload after it).
+ *
+ * Decode response: DecodeResponse header, then (if status == 0) exactly
+ * `frame_size` bytes of tightly-packed NV12 (no plane padding).
  */
 
 #ifndef TIER5_VAAPI_DAEMON_PROTOCOL_H
@@ -32,6 +63,11 @@
 #include <stdint.h>
 
 #define VAAPI_DAEMON_SOCKET_PATH "/dev/vaapi-helper/socket"
+
+typedef enum {
+    VAAPI_CMD_ENCODE = 1,
+    VAAPI_CMD_DECODE = 2,
+} VaapiCommand;
 
 /* NV12 only for now -- matches what a real Codec2 encoder input buffer
  * (GRALLOC_USAGE_HW_VIDEO_ENCODER) is expected to be, unlike the RGBA
@@ -59,5 +95,18 @@ typedef struct {
     int32_t status;      /* 0 = ok, negative = error (see vaErrorStr equivalents server-side) */
     uint32_t coded_size; /* bytes of Annex-B H.264 following this header, 0 if status != 0 */
 } EncodeResponse;
+
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t bitstream_size; /* bytes of Annex-B H.264 immediately following
+                              * this header on the wire - see this file's
+                              * own top comment for the exact NAL framing. */
+} DecodeRequest;
+
+typedef struct {
+    int32_t status;      /* 0 = ok, negative = error */
+    uint32_t frame_size; /* bytes of tightly-packed NV12 following this header, 0 if status != 0 */
+} DecodeResponse;
 
 #endif

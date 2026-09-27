@@ -128,6 +128,16 @@ long VaapiEncComponent::encodeViaDaemon(int dmabufFd, uint32_t width, uint32_t h
         return -1;
     }
 
+    // Tier 7: every connection now starts with a 4-byte command tag, read by
+    // the daemon via a plain read() before it touches either command's own
+    // request struct - see protocol.h's own top comment.
+    VaapiCommand cmd = VAAPI_CMD_ENCODE;
+    if (write(sockFd, &cmd, sizeof(cmd)) != (ssize_t)sizeof(cmd)) {
+        ALOGE("write(command tag) failed: %s", strerror(errno));
+        close(sockFd);
+        return -1;
+    }
+
     EncodeRequest req = {};
     req.width = width;
     req.height = height;

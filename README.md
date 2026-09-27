@@ -101,19 +101,27 @@ Each tier assumes the previous one is done. ⭐ marks the highest-leverage check
       capability. Unlike encode, NVIDIA genuinely speaks VA-API for *decode* (`nvidia-vaapi-driver`,
       confirmed via `vainfo`: real `VAEntrypointVLD` for H.264/HEVC/VP9) - not a vendor-specific
       fork of this project's approach, the fourth GPU for the same mechanism. **Standalone spike
-      done, bit-exact**: `tier6-vaapi-decode/main.c` (mirroring Tier 2's own rigor - a hand-written
+      first, bit-exact**: `tier6-vaapi-decode/main.c` (mirroring Tier 2's own rigor - a hand-written
       H.264 bitstream parser, no Android involved) decodes a real IDR frame via actual NVDEC
       hardware with output confirmed **byte-for-byte identical** to software decode via PSNR
-      (`y:inf u:inf v:inf`), not just visually correct. Six real bugs found and fixed on the way,
+      (`y:inf u:inf v:inf`), not just visually correct — six real bugs found and fixed on the way,
       including the two biggest: VA-API's slice-data buffer needs the NAL unit's own header byte
       included (not just the RBSP payload after it - found by reading `nvidia-vaapi-driver`'s own
       source after `NVD_LOG=1 NVD_LOG_VERBOSE=1` traced the failure to *before* any real decode
       call), and `chroma_qp_index_offset` parsed from the PPS but never carried through to the
       picture parameters (left luma bit-exact throughout while chroma stayed consistently, but not
-      randomly, off). See `DEVLOG.md`'s 2026-09-27 entries for the full trail, bug by bug. **Next**:
-      fold this into `tier5-vaapi-daemon`'s existing multi-vendor architecture as NVIDIA's own
-      supported decode path, then the Codec2-side decoder component - new work in either project,
-      since neither has a hardware *decoder* component yet (only encoders).
+      randomly, off). **Then folded into the real stack, same day**: `tier5-vaapi-daemon` now
+      dispatches encode and decode as two independent backends on one socket (a 4-byte command tag
+      picked before either request struct), and `codec2-component/VaapiDecComponent.{h,cpp}` is a
+      real `c2.hardware.decoder.h264` component, the structural mirror of the existing encoder.
+      Verified on two real hosts in one session: a GTX 1050 Ti (decode-only, no AMD/Intel GPU)
+      served a real decode request through the daemon's own socket protocol bit-exact
+      (`y:inf u:inf v:inf average:inf`), and an AMD Renoir APU (encode-only, no NVIDIA GPU)
+      confirmed the new command tag doesn't disturb the existing encode wire format. See
+      `DEVLOG.md`'s 2026-09-27 entries for the full trail, bug by bug and host by host. **Next**:
+      the real-device test - driving `VaapiDecComponent` through the genuine `MediaCodec`/
+      `Codec2Client` framework path, the way encode was eventually proven against a real
+      `Surface`-fed `GraphicBufferSource`.
 
 Even if it doesn't go further, each tier on its own is a publishable contribution — none of this
 has been documented by anyone until now.
@@ -160,9 +168,12 @@ across processes, unlike EGL's equivalent. Tier 5 is now 3-for-3 on every GPU th
 tried. See [DEVLOG.md](DEVLOG.md) for the real progress, session by session.
 
 **Tier 7 (hardware decode, NVIDIA) done as of 2026-09-27**: unlike encode, NVIDIA speaks real
-VA-API decode (`nvidia-vaapi-driver`) - the standalone spike gets bit-exact output (`PSNR
-y:inf u:inf v:inf`) from real NVDEC hardware. See the roadmap entry above and DEVLOG.md's
-2026-09-27 entries for the details.
+VA-API decode (`nvidia-vaapi-driver`) - bit-exact output (`PSNR y:inf u:inf v:inf`) from real
+NVDEC hardware, first in a standalone spike and then through the real stack: `tier5-vaapi-daemon`
+dispatches encode and decode as two independent backends on one socket, and
+`c2.hardware.decoder.h264` (`VaapiDecComponent`) is a real Codec2 component alongside the existing
+encoder. Verified on two real hosts (a decode-only NVIDIA GPU and an encode-only AMD GPU) in the
+same session. See the roadmap entry above and DEVLOG.md's 2026-09-27 entries for the details.
 
 ## Hardware compatibility
 
