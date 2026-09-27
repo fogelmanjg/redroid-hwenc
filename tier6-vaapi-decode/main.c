@@ -199,6 +199,7 @@ typedef struct {
     int weighted_pred_flag;
     int weighted_bipred_idc;
     int pic_init_qp_minus26;
+    int chroma_qp_index_offset;
     int deblocking_filter_control_present_flag;
     int redundant_pic_cnt_present_flag;
 } PpsInfo;
@@ -249,7 +250,7 @@ static void parse_pps(const uint8_t *rbsp, size_t size, PpsInfo *pps) {
     pps->weighted_bipred_idc = br_bits(&br, 2);
     pps->pic_init_qp_minus26 = br_se(&br);
     br_se(&br); /* pic_init_qs_minus26 */
-    br_se(&br); /* chroma_qp_index_offset */
+    pps->chroma_qp_index_offset = br_se(&br);
     pps->deblocking_filter_control_present_flag = br_bit(&br);
     br_bit(&br); /* constrained_intra_pred_flag */
     pps->redundant_pic_cnt_present_flag = br_bit(&br);
@@ -802,6 +803,19 @@ int main(void) {
         sps.log2_max_pic_order_cnt_lsb_minus4;
     pic_param.num_slice_groups_minus1 = 0;
     pic_param.pic_init_qp_minus26 = pps.pic_init_qp_minus26;
+    /* Parsed from PPS but never carried through to here (this program's
+     * own earlier version) - defaulted to 0 via memset instead of the
+     * real encoded value, dequantizing chroma coefficients at the wrong
+     * effective QP. Explains exactly the symptom that was left after the
+     * chroma plane-width fix: luma bit-exact (this field doesn't touch
+     * luma at all), chroma close but consistently off by a real, non-
+     * random amount (PSNR ~25dB, not noise-level). Baseline profile only
+     * ever had one chroma QP offset field; second_chroma_qp_index_offset
+     * (High profile onward) isn't present in this bitstream's own PPS at
+     * all, so mirroring the same value here matches the decoder's own
+     * required fallback when only the first is signaled. */
+    pic_param.chroma_qp_index_offset = pps.chroma_qp_index_offset;
+    pic_param.second_chroma_qp_index_offset = pps.chroma_qp_index_offset;
     pic_param.pic_fields.bits.entropy_coding_mode_flag = pps.entropy_coding_mode_flag;
     pic_param.pic_fields.bits.weighted_pred_flag = pps.weighted_pred_flag;
     pic_param.pic_fields.bits.weighted_bipred_idc = pps.weighted_bipred_idc;
@@ -973,14 +987,27 @@ int main(void) {
         int fd = prime_desc.objects[obj_idx].fd;
         uint64_t modifier = prime_desc.objects[obj_idx].drm_format_modifier;
         unsigned int plane_height = (li == 0) ? height : height / 2;
+        /* NV12 chroma has half as many *texels* across as luma, not the
+         * same width - each R8G8 texel here is one interleaved U,V pair
+         * covering a 2x2 luma block. Passing the full luma width (this
+         * program's own earlier version) told Vulkan the image was twice
+         * as many texels wide as the real plane, which happened to
+         * compute a plausible-looking rowPitch anyway (real chroma tiling
+         * padding and "2x the real width at half the depth" aren't far
+         * apart numerically) while actually reading each real row's bytes
+         * at the wrong stride - exactly the washed-out/ghosted look this
+         * produced, structure present but wrong (PSNR ~10dB) rather than
+         * random. */
+        unsigned int plane_width = (li == 0) ? width : width / 2;
         VkFormat vk_fmt = (prime_desc.layers[li].drm_format == 0x20203852) ? VK_FORMAT_R8_UNORM
                                                                             : VK_FORMAT_R8G8_UNORM;
         fprintf(stderr, "  de-tiling layer %u via Vulkan: drm_format=0x%x modifier=0x%llx "
-                        "plane_height=%u\n",
-                li, prime_desc.layers[li].drm_format, (unsigned long long)modifier, plane_height);
+                        "plane_width=%u plane_height=%u\n",
+                li, prime_desc.layers[li].drm_format, (unsigned long long)modifier, plane_width,
+                plane_height);
         uint8_t *plane_data;
         size_t plane_size;
-        vk_detile(fd, vk_fmt, width, plane_height, modifier, prime_desc.objects[obj_idx].size,
+        vk_detile(fd, vk_fmt, plane_width, plane_height, modifier, prime_desc.objects[obj_idx].size,
                   &plane_data, &plane_size);
         fwrite(plane_data, 1, plane_size, out);
         free(plane_data);

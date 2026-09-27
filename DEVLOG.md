@@ -1734,3 +1734,51 @@ issue is isolated to that one plane specifically (it uses a different tiling `ro
 being a sign of a deeper problem. **Next session**: fix the isolated chroma read, then decide
 whether to fold this into the existing `tier5-vaapi-daemon` architecture as NVIDIA's fourth
 supported GPU family or keep it as this project's first dedicated *decode* daemon variant.
+
+## 2026-09-27 (same day, continued) — Tier 7 decode: chroma fixed, bit-exact against software decode
+
+Picked up exactly where the previous entry left off: the isolated chroma issue. Two more real
+bugs, both found by reasoning about what could possibly differ between luma (bit-exact) and
+chroma (visibly off) rather than guessing blind - the fix has to be in something the two planes
+don't share.
+
+**Bug 1: chroma plane width was wrong by 2x.** This spike's own de-tiling call passed the full
+luma width (640) for the chroma plane's Vulkan image too, instead of 320 - NV12 chroma has half
+as many *texels* across as luma, not the same count, since each `R8G8`/`GR88` texel here is one
+interleaved U,V pair covering a 2x2 luma block. The mistake didn't produce an obvious crash or
+garbage: Vulkan's own computed rowPitch for a wrongly-640-wide `R8G8_UNORM` image (1280 bytes/row)
+happened to land in the same ballpark as this GPU's real tiled chroma padding, so the probe step
+"succeeded" and produced structured-but-wrong output (a washed-out/ghosted look, PSNR ~10dB) -
+recognizable content, wrong stride underneath it. Fixed by passing `width/2` for the chroma
+plane specifically; the probed layout's own reported size then matched the real dma-buf object's
+size exactly (163840 both ways) for the first time, a good independent confirmation the width was
+now actually correct rather than just less wrong.
+
+**Bug 2: `chroma_qp_index_offset`, parsed from the PPS and immediately discarded** - never carried
+through to `VAPictureParameterBufferH264::chroma_qp_index_offset`, left at its zeroed
+`memset` default instead of the real encoded value. This field exists purely to dequantize chroma
+coefficients at a QP offset from luma's own QP; getting it wrong doesn't touch luma at all (which
+stayed bit-exact through this entire investigation) while leaving chroma "close but consistently
+off by a real amount" - exactly the PSNR ~25dB (after the width fix, before this one) symptom: not
+noise, a real systematic dequantization error. Fixed by keeping the parsed PPS value in `PpsInfo`
+and setting both `chroma_qp_index_offset` and `second_chroma_qp_index_offset` from it (this
+baseline-profile bitstream's own PPS only ever signals the one field; mirroring it into both is
+the correct fallback when a second, distinct value was never coded).
+
+**Result: bit-exact.** `ffmpeg`'s own PSNR filter against software decode of the same frame:
+`y:inf u:inf v:inf average:inf` - every plane byte-for-byte identical, not just visually correct.
+**Tier 7's own spike is done**: real NVDEC hardware decode via VA-API, driven by this program's
+own from-scratch H.264 bitstream parser, producing output indistinguishable from a reference
+software decoder. Six real bugs total across both sessions (vaDeriveImage unsupported, the tiled
+decode surface, missing `slice_data_bit_offset`, the missing NAL header byte in slice data, the
+chroma plane width, and `chroma_qp_index_offset`) - none of them NVIDIA-specific except the tiled-
+surface handling and the driver's own bitstream-reconstruction quirk that made the NAL-header bug
+possible to hit in the first place; the rest are the same category of "VA-API's real conventions,
+learned by reading a real implementation's source rather than assuming the spec's prose is
+sufficient" bugs Tier 2's own encode work hit for the opposite direction.
+
+**Next**: fold this into `tier5-vaapi-daemon`'s existing multi-vendor architecture as NVIDIA's own
+supported decode path (the daemon already has the SCM_RIGHTS transport and per-vendor dispatch
+shape this needs), then the Codec2-side wiring - a real decoder component (input=compressed
+bitstream via `C2LinearBlock`, output=decoded frame via `C2GraphicBlock` from a `BlockPool`) is
+new work in either project, since neither has one yet.

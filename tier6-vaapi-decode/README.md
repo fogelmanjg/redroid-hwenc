@@ -82,13 +82,33 @@ full trail with the diagnostic steps kept in:
    includes the NAL header byte" is the standard VA-API convention every
    backend expects.
 
+5. **Chroma plane width was wrong by 2x.** NV12 chroma has half as many
+   *texels* across as luma, not the same count - each `R8G8`/`GR88` texel
+   is one interleaved U,V pair covering a 2x2 luma block. Passing the full
+   luma width for the chroma plane's own Vulkan image too computed a
+   rowPitch that happened to look plausible (in the same ballpark as this
+   GPU's real tiled chroma padding), so the bug produced structured-but-
+   wrong output (a washed-out/ghosted look, PSNR ~10dB) rather than an
+   obvious failure. Fixed by passing `width/2` for chroma specifically -
+   confirmed by the probed layout's own size then matching the real
+   dma-buf object's size exactly, for the first time.
+
+6. **`chroma_qp_index_offset`**, parsed from the PPS and immediately
+   discarded, never reached `VAPictureParameterBufferH264`'s own field -
+   left at zero instead of the real encoded value. Doesn't touch luma at
+   all (which stayed bit-exact throughout), but leaves chroma dequantized
+   at the wrong effective QP: consistently, not randomly, off (PSNR ~25dB
+   after the width fix, before this one). Fixed by keeping the parsed PPS
+   value and setting both `chroma_qp_index_offset` and
+   `second_chroma_qp_index_offset` from it.
+
 ## Result
 
-Real, recognizable decoded content, confirmed against software decode via
-`ffmpeg`'s own PSNR filter: **luma is pixel-perfect** (`PSNR y:inf`).
-Chroma is still off (`u:10.2 v:10.1`, a washed-out/ghosted color look over
-otherwise-correct structure) - an isolated, understood remaining issue
-(the chroma plane uses a different tiling `rowPitch` than luma, and/or a
-`GR88`-format channel-order assumption), not a sign of a deeper problem.
-Next: fix that, then fold this into `tier5-vaapi-daemon`'s existing
-multi-vendor architecture as NVIDIA's own supported decode path.
+**Bit-exact.** `ffmpeg`'s own PSNR filter against software decode of the
+same frame: `y:inf u:inf v:inf average:inf` - every plane byte-for-byte
+identical, not just visually correct. Real NVDEC hardware decode via
+VA-API, driven entirely by this program's own from-scratch H.264
+bitstream parser. Next: fold this into `tier5-vaapi-daemon`'s existing
+multi-vendor architecture as NVIDIA's own supported decode path, then the
+Codec2-side decoder component (new work in either project - neither has
+one yet, only encoders).

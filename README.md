@@ -95,23 +95,25 @@ Each tier assumes the previous one is done. ⭐ marks the highest-leverage check
       `Codec2InfoBuilder`, the standard AOSP framework mechanism): `scrcpy` picks up
       `c2.hardware.encoder.h264` automatically once it's correctly registered, with no changes to
       redroid or scrcpy needed at all.
-- [ ] **Tier 7 — Hardware video decode, and a fourth GPU (NVIDIA).** A new direction, not a
+- [x] **Tier 7 — ⭐ Hardware video decode, and a fourth GPU (NVIDIA).** A new direction, not a
       continuation of Tier 0-6's encode work, and motivated by a sibling project
       ([redroid-nvidia](https://github.com/fogelmanjg/redroid-nvidia)) needing the same
       capability. Unlike encode, NVIDIA genuinely speaks VA-API for *decode* (`nvidia-vaapi-driver`,
       confirmed via `vainfo`: real `VAEntrypointVLD` for H.264/HEVC/VP9) - not a vendor-specific
-      fork of this project's approach, the fourth GPU for the same mechanism. **In progress**:
-      standalone spike (`tier6-vaapi-decode/main.c`, mirroring Tier 2's own rigor - a hand-written
+      fork of this project's approach, the fourth GPU for the same mechanism. **Standalone spike
+      done, bit-exact**: `tier6-vaapi-decode/main.c` (mirroring Tier 2's own rigor - a hand-written
       H.264 bitstream parser, no Android involved) decodes a real IDR frame via actual NVDEC
-      hardware with **pixel-perfect luma** confirmed against software decode via PSNR
-      (`y:inf`) - chroma is still off (an isolated, understood plane-specific issue, not a sign of
-      a deeper problem). Four real bugs found and fixed on the way, including the actual root
-      cause: VA-API's slice-data buffer needs the NAL unit's own header byte included, not just
-      the RBSP payload after it - a two-line fix, once a read of `nvidia-vaapi-driver`'s own
-      source (after `NVD_LOG=1 NVD_LOG_VERBOSE=1` traced the failure to *before* any real decode
-      call) pinned exactly where it was needed. See `DEVLOG.md`'s 2026-09-27 entry for the full
-      trail. **Next**: fix the chroma plane read, then fold this into `tier5-vaapi-daemon`'s
-      existing architecture as NVIDIA's own supported path.
+      hardware with output confirmed **byte-for-byte identical** to software decode via PSNR
+      (`y:inf u:inf v:inf`), not just visually correct. Six real bugs found and fixed on the way,
+      including the two biggest: VA-API's slice-data buffer needs the NAL unit's own header byte
+      included (not just the RBSP payload after it - found by reading `nvidia-vaapi-driver`'s own
+      source after `NVD_LOG=1 NVD_LOG_VERBOSE=1` traced the failure to *before* any real decode
+      call), and `chroma_qp_index_offset` parsed from the PPS but never carried through to the
+      picture parameters (left luma bit-exact throughout while chroma stayed consistently, but not
+      randomly, off). See `DEVLOG.md`'s 2026-09-27 entries for the full trail, bug by bug. **Next**:
+      fold this into `tier5-vaapi-daemon`'s existing multi-vendor architecture as NVIDIA's own
+      supported decode path, then the Codec2-side decoder component - new work in either project,
+      since neither has a hardware *decoder* component yet (only encoders).
 
 Even if it doesn't go further, each tier on its own is a publishable contribution — none of this
 has been documented by anyone until now.
@@ -157,10 +159,10 @@ VA-API's own *old*, pre-modifier import path resolves this GPU's opaque tiling c
 across processes, unlike EGL's equivalent. Tier 5 is now 3-for-3 on every GPU this project has
 tried. See [DEVLOG.md](DEVLOG.md) for the real progress, session by session.
 
-**Tier 7 (hardware decode, NVIDIA) kicked off 2026-09-27**: unlike encode, NVIDIA speaks real
-VA-API decode (`nvidia-vaapi-driver`) - the standalone spike already gets pixel-perfect luma from
-real NVDEC hardware, chroma still pending. See the roadmap entry above and DEVLOG.md's 2026-09-27
-entry for the details.
+**Tier 7 (hardware decode, NVIDIA) done as of 2026-09-27**: unlike encode, NVIDIA speaks real
+VA-API decode (`nvidia-vaapi-driver`) - the standalone spike gets bit-exact output (`PSNR
+y:inf u:inf v:inf`) from real NVDEC hardware. See the roadmap entry above and DEVLOG.md's
+2026-09-27 entries for the details.
 
 ## Hardware compatibility
 
