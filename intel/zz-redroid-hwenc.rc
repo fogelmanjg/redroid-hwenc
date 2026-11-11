@@ -1,0 +1,6 @@
+# Gralloc-backed BLOB output blocks: no legacy ion or dma_heap required.
+on post-fs-data
+    setprop debug.stagefright.ccodec 4
+    setprop debug.stagefright.c2inputsurface -1
+    setprop media.c2.hal.selection aidl
+    setprop debug.stagefright.c2-poolmask 786432

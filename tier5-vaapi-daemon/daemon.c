@@ -447,6 +447,12 @@ static int vaapi_state_init(vaapi_state_t *st) {
             vaQueryVendorString(st->dpy));
 
     st->rgba_modifier = rgba_modifier_init(st);
+    /* Haswell/i965 can accept PRIME2 imports yet encode black frames. Keep
+     * automatic modifier selection for other drivers; this is an opt-in. */
+    if (getenv("REDROID_VAAPI_LEGACY_PRIME")) {
+        st->use_legacy_prime = 1;
+        fprintf(stderr, "Using legacy PRIME import override\n");
+    }
     if (st->use_legacy_prime) {
         fprintf(stderr,
                 "This GPU can't describe its RGBA render-target tiling as a DRM modifier -- "

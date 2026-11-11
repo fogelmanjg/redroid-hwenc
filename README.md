@@ -1,5 +1,11 @@
 # redroid-hwenc
 
+> **Intel Haswell / HD Graphics 4400 (i965) profile, UNCONFIRMED on this project's own fleet
+> (no Haswell hardware here to test it on):** ported from
+> [artempavlov/redroid-hwenc](https://github.com/artempavlov/redroid-hwenc), see
+> [intel/README.md](intel/README.md) for the i965 profile, cros/minigbm handle adaptation,
+> the tested v0.2.0 binary patcher, build instructions and that fork's own verification limits.
+
 **Languages:** English | [Español](README.es.md) | [中文](README.zh-CN.md)
 
 > This project's official language is **English**. The other language files are provided for

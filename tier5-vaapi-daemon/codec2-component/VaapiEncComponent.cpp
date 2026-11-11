@@ -2,6 +2,7 @@
 #define LOG_TAG "VaapiEncComponent"
 
 #include "VaapiEncComponent.h"
+#include "InputHandleLayout.h"
 
 #include <errno.h>
 #include <string.h>
@@ -10,6 +11,8 @@
 #include <unistd.h>
 
 #include <string>
+
+#include <cutils/properties.h>
 
 #include <log/log.h>
 #include <media/stagefright/MediaDefs.h>
@@ -259,6 +262,9 @@ void VaapiEncComponent::process(const std::unique_ptr<C2Work> &work,
         work->workletsProcessed = 1u;
         return;
     }
+    // The historical Tier 5.8 notes below describe the default GBM path.
+    // With ro.hardware.gralloc=cros, readInputFrameLayout instead uses the
+    // fixed minigbm offsets; the fd count does not shift its reserved slots.
     // Tier 5.8 finding: a real Surface-sourced frame (scrcpy's virtual
     // display capture via GraphicBufferSource) does NOT arrive as a
     // cros_gralloc_handle at all -- confirmed authoritatively via
@@ -289,11 +295,23 @@ void VaapiEncComponent::process(const std::unique_ptr<C2Work> &work,
     // this daemon recompiled locally (plain gcc, no AOSP) -- never this
     // component rebuilt, which needs the one machine with the AOSP tree.
     int dmabufFd = handle->data[0];
-    const int32_t *ints = &handle->data[handle->numFds];
-    uint32_t width = (uint32_t)ints[2];
-    uint32_t height = (uint32_t)ints[3];
-    uint32_t strideY = (uint32_t)ints[6];
-    uint32_t dmabufSize = strideY * height;
+    char gralloc[PROPERTY_VALUE_MAX] = {};
+    property_get("ro.hardware.gralloc", gralloc, "");
+    InputFrameLayout layout{};
+    if (handle->numInts < 0 || handle->numInts > 1024 ||
+        !readInputFrameLayout(handle,
+                sizeof(native_handle_t) + sizeof(int) *
+                    (size_t(handle->numFds) + size_t(handle->numInts)),
+                handle->numFds, strcmp(gralloc, "cros") == 0, &layout)) {
+        ALOGE("invalid input handle layout for gralloc=%s", gralloc);
+        work->result = C2_CORRUPTED;
+        work->workletsProcessed = 1u;
+        return;
+    }
+    uint32_t width = layout.width;
+    uint32_t height = layout.height;
+    uint32_t strideY = layout.stride;
+    uint32_t dmabufSize = layout.size;
     uint64_t drmFormatModifier = 0; /* ignored by the daemon, see above */
 
     unsigned char *coded = nullptr;

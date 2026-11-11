@@ -67,6 +67,12 @@ static int ensure_codec(FFmpegEncState *s, unsigned int width, unsigned int heig
     s->ctx->max_b_frames = 0;
     s->ctx->refs = 1;
     s->ctx->profile = AV_PROFILE_H264_CONSTRAINED_BASELINE;
+    /* i965's RGB conversion on the tested Haswell path produces full-range
+     * NV12. Signal that range instead of letting decoders clip its levels. */
+    if (getenv("REDROID_VAAPI_FULL_RANGE")) {
+        s->ctx->color_range = AVCOL_RANGE_JPEG;
+        s->ctx->colorspace = AVCOL_SPC_SMPTE170M;
+    }
 
     AVBufferRef *frames_ref = av_hwframe_ctx_alloc(s->hw_dev);
     if (!frames_ref) { fprintf(stderr, "ffmpeg_encode: av_hwframe_ctx_alloc failed\n"); close_codec(s); return -1; }
