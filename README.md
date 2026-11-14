@@ -1,11 +1,5 @@
 # redroid-hwenc
 
-> **Intel Haswell / HD Graphics 4400 (i965) profile, UNCONFIRMED on this project's own fleet
-> (no Haswell hardware here to test it on):** ported from
-> [artempavlov/redroid-hwenc](https://github.com/artempavlov/redroid-hwenc), see
-> [intel/README.md](intel/README.md) for the i965 profile, cros/minigbm handle adaptation,
-> the tested v0.2.0 binary patcher, build instructions and that fork's own verification limits.
-
 **Languages:** English | [Español](README.es.md) | [中文](README.zh-CN.md)
 
 > This project's official language is **English**. The other language files are provided for
@@ -81,6 +75,7 @@ and DEVLOG.md for what each GPU's own fix actually was.
 | AMD Renoir (Ryzen APU, integrated) | GFX9 | **Full pipeline works** | Reference implementation. P frames (5.14) work; `ffmpeg` backend (5.16) also validated here. |
 | AMD Radeon RX 480 (Polaris, discrete) | GFX8 | **Full pipeline works** | No DRM modifier available for this GPU/format at all — needed VA-API's old pre-modifier import path. P frames (5.14) work. **Avoid the `ffmpeg` backend (5.16) here**: real GPU hangs during validation (timeout, full reset, one needing a host reboot) — stay on the default (`legacy`) backend. |
 | Intel Iris Xe (TigerLake-LP, integrated) | Gen12 | **Full pipeline works** | Same unmodified vendor image as AMD, no rebuild. One vendor-specific tiling bug, fixed in the daemon. P frames on the default (`legacy`) backend are **broken** (5.14: ~60% of frames fail to decode) — use the `ffmpeg` backend (5.16) for working P frames here. |
+| Intel Haswell / HD Graphics 4400 (i965, integrated) | Gen7.5 | **Unconfirmed** | Community-contributed, ported from [artempavlov/redroid-hwenc](https://github.com/artempavlov/redroid-hwenc) — no Haswell hardware in this project's own reach to verify it on. i965 profile, cros/minigbm handle adaptation, a tested v0.2.0 binary patcher; see [intel/README.md](intel/README.md) for the actual build/verification status, which is more limited than this table's usual bar. |
 
 Vendor-agnostic hardware **decode for apps** (5.15, `hwdec.c` — H.264/HEVC/VP9, separate from the
 encode table above and from Tier 7's NVIDIA-only decode): confirmed bit-exact against software
