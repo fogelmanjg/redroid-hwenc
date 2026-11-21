@@ -277,6 +277,33 @@ sessions were both checked and ruled out as the sole cause). Polaris keeps using
 `legacy` on Intel) are warned about, never silently picked, by whatever integrates this daemon
 (the parent redroid-forge project does it per-host, in Settings/instance creation/Doctor).
 
+## 5.17: one encoder per stream, connection isolation, and the memory leak
+
+Found running redroid-forge with several viewers at once (21/11/2026); all three are in `daemon.c`.
+
+- **One encoder per stream.** The host had a single encoder state (one VA-API context, one pair of
+  reconstruction surfaces, one rate control), and `gop.h` told streams apart by (pid, width,
+  height). Two viewers of the *same* instance are two encoders in the same Codec2 process at the
+  same resolution, so P frames of one were coded against the other's reconstruction: black/frozen
+  video in both, and a bitstream with crossed references reaching the clients' hardware decoders.
+  `EncodeRequest.reserved` is now `stream_id`, chosen by the Android component per encoder session,
+  and every (pid, stream_id) gets its own slot -- context, surfaces, reference, rate control --
+  exactly like N independent encoders. Slots are freed after 30 s without frames, LRU when all are
+  busy. A component that sends 0 (older builds, and Tier 8's HIDL port for now) gets one slot per
+  process: still correct across instances, but two viewers of one such instance stay broken. The
+  ffmpeg backend (5.16) still has one libavcodec encoder, so a stream change forces an IDR there.
+- **Connection isolation.** Every connection used to be served start to finish on the `accept()`
+  thread with no timeouts: one client that connected and stalled froze encode for every instance,
+  and a client hanging up before reading its response raised `SIGPIPE`, which killed the daemon.
+  Now: `SIGPIPE` ignored, one thread per connection (only the GPU work is serialized), socket
+  timeouts on every request/response, caps on simultaneous connections (total and per process), and
+  a per-process circuit breaker on requests per second. `test/conn-stress.c` exercises the stall
+  and flood cases.
+- **The memory leak.** The legacy encoder created 3-9 VA parameter/packed-header buffers per frame
+  and destroyed only the coded buffer; Mesa does not free them on `vaRenderPicture`/`vaEndPicture`.
+  ~27 KB per frame, never returned (a long-running host reached several GB). Destroyed after
+  `vaEndPicture` now: measured flat over thousands of frames, one and two streams.
+
 ## Two backends, one daemon
 
 `daemon.c`'s `main()` initializes encode (`vaapi_state_init()`) and decode (`decode_h264_init()`)
@@ -341,6 +368,11 @@ here to avoid touching tested, working source for a cosmetic reason.
 | `REDROID_FORGE_ENCODE_IDR_PERIOD` | Legacy backend only (5.14). Frames per IDR; > 1 turns P frames on. Default 1: all-intra. |
 | `REDROID_FORGE_ENCODE_INTRA_ONLY` | Legacy backend only. `1` forces all-intra even if a period is set. |
 | `REDROID_FORGE_ENCODE_P_ON_INTEL` | Legacy backend only. `1` forces P frames on Intel despite the known-broken decode (5.14) — for whoever wants to debug it. |
+| `REDROID_FORGE_DAEMON_IO_TIMEOUT_MS` | 5.17. Socket timeout for receiving a request and sending its response, per connection (default 5000; hwdec streams are exempt). |
+| `REDROID_FORGE_DAEMON_MAX_CONNECTIONS` | 5.17. Simultaneous connections, total (default 64). |
+| `REDROID_FORGE_DAEMON_MAX_CONNECTIONS_PER_PID` | 5.17. Simultaneous connections per client process (default 16). |
+| `REDROID_FORGE_DAEMON_MAX_RPS` / `_RPS_SUSTAIN_S` | 5.17. Per-process circuit breaker: more than MAX_RPS connections/s (default 150; one encoded frame is one connection) for SUSTAIN_S whole seconds (default 3) blocks that process 5 s, doubling up to 60 s on repeat. 0 disables it. |
+| `REDROID_FORGE_DAEMON_MAX_STREAMS` | 5.17. Encoder slots (default 8, max 32). |
 | `REDROID_FORGE_ENCODE_STATS` | If set, prints the real encoded bitrate (against the target) every 5 s, and the IDR/P frame counts. |
 | `REDROID_FORGE_HWDEC_DOWNLOAD` | 5.15 only. How a decoded frame is brought from the GPU to RAM: `derive-sse` (default), `derive`, `getimage`, or `ffmpeg`. The first frame of every session is cross-checked against the ffmpeg path regardless; a mismatch falls that whole session back to it. |
 | `REDROID_FORGE_HWDEC_STATS` | 5.15 only. Prints per-stage timing (send, GPU wait, download, copy) per session, plus daemon-wide wait/queue/socket averages. |

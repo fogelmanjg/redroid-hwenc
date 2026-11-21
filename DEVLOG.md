@@ -2081,3 +2081,25 @@ story; redroid-forge is where someone who just wants a working Android container
 land. The two were always related (redroid-forge's `hwenc`/`hwdec` modules ARE this project's
 code, consumed as a dependency) but that relationship was never stated plainly for a reader
 arriving at this repo cold.
+
+## 21/11/2026 -- v0.3.0: one encoder per stream, connection isolation, the memory leak
+
+Three real bugs, all found running redroid-forge's production host with several viewers at once;
+details in `tier5-vaapi-daemon/README.md` section 5.17.
+
+- A host whose daemon "got heavy": RSS went from ~55 MB to 3-4.5 GB in 12-17 h. Measured on a
+  clean dev forge at ~27 KB per encoded frame, never returned; idle it stayed flat. Cause: the
+  legacy encoder never destroyed its per-frame parameter/packed-header VA buffers. Fixed, measured
+  flat over 5.7k frames.
+- Two viewers of the same instance (a scrcpy app on a tablet plus the browser viewer) gave black
+  or frozen video in both, recovering ~20 s after one left. `gop.h` identified a stream by (pid,
+  width, height) on the assumption that each instance runs one encoder -- false with two viewers.
+  P frames were coded against the other stream's reconstruction. All-intra was rejected as the fix
+  (bandwidth); instead the Android component now sends a per-session `stream_id` and the daemon
+  keeps one encoder per stream, the same model as Android's software encoder (one per MediaCodec,
+  measured on a software-encoded instance with three viewers: three encoders, ~17 % of a core each).
+  Verified with two simultaneous recordings: two slots, both decode clean with P frames.
+- The daemon served every connection on its accept thread with no timeouts, and died on SIGPIPE
+  when a client hung up early (reproduced: 200 early hang-ups kill v0.2.0's daemon, not this one).
+  A first draft of the rate limit used ~10 req/s from an earlier, near-idle measurement; one frame
+  is one request, so a real stream is up to 60/s -- the default is 150/s, sustained 3 s.
