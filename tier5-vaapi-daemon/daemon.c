@@ -314,6 +314,15 @@ typedef struct {
      * set once at startup, means encode_one_frame() takes that import path
      * for this GPU's requests instead of DRM_PRIME_2. */
     int use_legacy_prime;
+    /* Per-stream encoder slot (21/11/2026, see stream_slot()). One vaapi_state_t is no longer "the" encoder: the
+     * device fields above (drm_fd, dpy, entrypoint, config_id, vpp_config_id, rgba_modifier, use_legacy_prime) are
+     * copied from the one state vaapi_state_init() set up, and everything per stream (context, surfaces, recon,
+     * width/height, idr_pic_id, gop, and now the rate control) lives in its own slot. */
+    RateCtl rc;
+    int in_use;
+    pid_t owner_pid;
+    uint32_t stream_id;
+    int64_t last_used_ns;
 } vaapi_state_t;
 
 /* Tier 5.9: reproduces minigbm's own tie-break for which tiling a
@@ -617,7 +626,8 @@ static unsigned char *normalize_start_codes(unsigned char *in, size_t n, size_t 
 /* Imports the client's dma-buf as surfaces[0], runs the same encode
  * sequence tier2/tier3 already proved, and returns malloc'd Annex-B H.264
  * bytes (caller frees). Returns byte count, or -1 on error. */
-static RateCtl g_rate_ctl;  /* encode requests are served one at a time */
+/* Whether the rate control may use P frames (decided once in gop_config_init); applied to each slot's rc. */
+static int g_rc_gop;
 
 static int64_t now_ns(void) {
     struct timespec ts;
@@ -647,7 +657,7 @@ static void gop_config_init(const vaapi_state_t *st) {
     if (p && atoi(p) > 1) g_gop_period = (unsigned int)atoi(p);
     const char *io = getenv("REDROID_FORGE_ENCODE_INTRA_ONLY");
     g_gop_intra_only = (g_gop_period <= 1) || (io && atoi(io) != 0);
-    g_rate_ctl.gop = !g_gop_intra_only;
+    g_rc_gop = !g_gop_intra_only;
     /* The Intel driver (iHD) produces P frames that do not decode with the hand-written slice header (measured on an Iris Xe,
      * entrypoint EncSlice: most P frames fail with "top block unavailable for requested intra mode"). Stay all-intra there
      * unless REDROID_FORGE_ENCODE_P_ON_INTEL=1, to experiment -- this restriction is specific to the legacy backend's own
@@ -659,7 +669,7 @@ static void gop_config_init(const vaapi_state_t *st) {
         if (!(force && atoi(force) != 0)) {
             fprintf(stderr, "encoder: P frames are not supported on the Intel driver (%s): staying all-intra\n", vendor);
             g_gop_intra_only = 1;
-            g_rate_ctl.gop = 0;
+            g_rc_gop = 0;
         }
     }
     if (!g_gop_intra_only) fprintf(stderr, "encoder: P frames, an IDR every %u frames\n", g_gop_period);
@@ -780,7 +790,8 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
     gop_config_init(st);
     const int64_t gop_now = now_ns();
     const GopDecision gd = gop_next(&st->gop, peer_pid, req->width, req->height, gop_now, g_gop_period, g_gop_intra_only);
-    const int qp = rc_next_qp_t(&g_rate_ctl, now_ns(), req->bitrate, req->width, req->height, gd.is_idr);
+    st->rc.gop = g_rc_gop;
+    const int qp = rc_next_qp_t(&st->rc, now_ns(), req->bitrate, req->width, req->height, gd.is_idr);
 
     if (import_dmabuf_as_surface0(st, dmabuf_fd, req) != 0) return -1;
 
@@ -923,7 +934,7 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
     vaDestroySurfaces(st->dpy, &st->surfaces[0], 1);
 
     out = normalize_start_codes(out, total, &total);
-    rc_frame_done_t(&g_rate_ctl, now_ns(), total, qp, gd.is_idr);
+    rc_frame_done_t(&st->rc, now_ns(), total, qp, gd.is_idr);
     gop_commit(&st->gop, &gd, peer_pid, req->width, req->height, gop_now);
     if (getenv("REDROID_FORGE_ENCODE_STATS")) {
         static int64_t t0; static uint64_t frames, bytes;
@@ -1034,7 +1045,7 @@ static void send_response(int conn_fd, int32_t status, const unsigned char *buf,
 }
 
 /* Serializes everything that touches the shared VA-API encode state (vaapi_state_t: context,
- * surfaces, gop, g_rate_ctl, the ffmpeg backend, the legacy NVIDIA decode's static output buffer).
+ * surfaces, gop, rate control, the stream slot table, the ffmpeg backend, the legacy NVIDIA decode's static output buffer).
  * Until 21/11/2026 that serialization came for free from serving every connection on the one
  * accept() thread -- which also meant a client that connected and then stalled (never sent its
  * request, or never read its response) blocked the encoder for every other instance on the host.
@@ -1043,7 +1054,84 @@ static void send_response(int conn_fd, int32_t status, const unsigned char *buf,
  * timeouts set at accept time. */
 static pthread_mutex_t g_gpu_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void handle_encode(vaapi_state_t *st, int have_encode, int conn_fd, pid_t peer_pid) {
+/* ------------------------------------------------------------------ *
+ * One encoder per stream (21/11/2026). Before, the whole host had ONE encoder state: one VA-API context, one
+ * pair of reconstruction surfaces, one rate control. gop.h told streams apart by (pid, width, height), which
+ * breaks with two viewers of the SAME instance (e.g. a scrcpy app plus the browser's expandida): two encoders
+ * in the same Codec2 process at the same native resolution looked like one stream, so P frames of one were
+ * coded against the other's reconstruction -- black/frozen video in both, and a bitstream with crossed
+ * references reaching the clients' hardware decoders. Every encoder now sends its own stream_id
+ * (EncodeRequest.stream_id), and every (pid, stream_id) gets a slot of its own: its own context, surfaces,
+ * reference and rate control, exactly like N independent encoders (the same model Android's software encoder
+ * has, one instance per MediaCodec). An older Android component sends stream_id 0: it gets one slot per
+ * process, which is still better than before (two instances of different resolutions no longer destroy and
+ * recreate each other's context on every frame), but two viewers of one instance stay broken until that
+ * component is updated.
+ *
+ * Slots are freed after STREAM_IDLE_NS without frames (a viewer that left; the GPU memory comes back), or the
+ * least recently used one is taken when all REDROID_FORGE_DAEMON_MAX_STREAMS (default 8) are busy.
+ * Everything here runs under g_gpu_lock.
+ * ------------------------------------------------------------------ */
+#define STREAM_IDLE_NS (30LL * 1000000000LL)
+#define MAX_STREAMS_CAP 32
+static vaapi_state_t g_base;                 /* the device-level state vaapi_state_init() set up */
+static vaapi_state_t g_slots[MAX_STREAMS_CAP];
+static int g_max_streams = 8;
+
+static void stream_release(vaapi_state_t *s, const char *why) {
+    if (s->have_context) {
+        vaDestroyContext(s->dpy, s->context_id);
+        vaDestroyContext(s->dpy, s->vpp_context_id);
+        vaDestroySurfaces(s->dpy, s->recon, 2);
+        vaDestroySurfaces(s->dpy, &s->surfaces[2], 1);
+        s->have_context = 0;
+    }
+    if (s->in_use)
+        fprintf(stderr, "stream: pid %d id %08x released (%s)\n", (int)s->owner_pid, s->stream_id, why);
+    s->in_use = 0;
+}
+
+static vaapi_state_t *stream_slot(pid_t pid, uint32_t stream_id) {
+    const int64_t now = now_ns();
+    vaapi_state_t *hit = NULL, *free_slot = NULL, *lru = NULL;
+    int busy = 0;
+    for (int i = 0; i < g_max_streams; i++) {
+        vaapi_state_t *s = &g_slots[i];
+        if (s->in_use && now - s->last_used_ns > STREAM_IDLE_NS) stream_release(s, "idle");
+        if (!s->in_use) { if (!free_slot) free_slot = s; continue; }
+        busy++;
+        if (s->owner_pid == pid && s->stream_id == stream_id) hit = s;
+        else if (!lru || s->last_used_ns < lru->last_used_ns) lru = s;
+    }
+    if (hit) { hit->last_used_ns = now; return hit; }
+    vaapi_state_t *s = free_slot;
+    if (!s) { s = lru; stream_release(s, "evicted, all slots busy"); busy--; }
+    /* A fresh slot: the device fields from g_base, every per-stream field zero (no context, no reference, a
+     * new rate control). */
+    *s = g_base;
+    s->have_context = 0;
+    s->idr_pic_id = 0;
+    memset(&s->gop, 0, sizeof(s->gop));
+    memset(&s->rc, 0, sizeof(s->rc));
+    s->in_use = 1;
+    s->owner_pid = pid;
+    s->stream_id = stream_id;
+    s->last_used_ns = now;
+    fprintf(stderr, "stream: pid %d id %08x -> new encoder slot (%d of %d in use)\n", (int)pid, stream_id, busy + 1,
+            g_max_streams);
+    return s;
+}
+
+#ifdef HAVE_HWDEC
+/* The ffmpeg backend still has ONE libavcodec encoder for the whole host (see ffmpeg_encode.h), so its
+ * references cross streams just like the legacy encoder's used to: when the stream changes, that frame is
+ * forced to be an IDR (always correct, costs bits only while two streams interleave). Per-stream libavcodec
+ * encoders are a follow-up. */
+static const vaapi_state_t *g_ffmpeg_last_slot;
+#endif
+
+static void handle_encode(vaapi_state_t *unused_st, int have_encode, int conn_fd, pid_t peer_pid) {
+    (void)unused_st;
     EncodeRequest req;
     int dmabuf_fd = -1;
     if (recv_request(conn_fd, &req, &dmabuf_fd) != 0) {
@@ -1063,9 +1151,13 @@ static void handle_encode(vaapi_state_t *st, int have_encode, int conn_fd, pid_t
     unsigned char *out_buf = NULL;
     long n;
     pthread_mutex_lock(&g_gpu_lock);
+    vaapi_state_t *st = stream_slot(peer_pid, req.stream_id);
 #ifdef HAVE_HWDEC
-    if (g_backend_is_ffmpeg) n = encode_one_frame_ffmpeg(st, dmabuf_fd, &req, peer_pid, &out_buf);
-    else
+    if (g_backend_is_ffmpeg) {
+        if (g_ffmpeg_last_slot != st) gop_reset(&st->gop);  /* the shared libavcodec encoder holds another stream's reference */
+        g_ffmpeg_last_slot = st;
+        n = encode_one_frame_ffmpeg(st, dmabuf_fd, &req, peer_pid, &out_buf);
+    } else
 #endif
         n = encode_one_frame(st, dmabuf_fd, &req, peer_pid, &out_buf);
     if (n < 0) gop_reset(&st->gop);  /* the reference may be lost: the next frame is an IDR */
@@ -1702,6 +1794,10 @@ int main(void) {
      * daemon has nothing to actually do. */
     vaapi_state_t st;
     int have_encode = (vaapi_state_init(&st) == 0);
+    if (have_encode) g_base = st;  /* device-level state every encoder slot starts from (see stream_slot) */
+    g_max_streams = env_int("REDROID_FORGE_DAEMON_MAX_STREAMS", 8);
+    if (g_max_streams < 1) g_max_streams = 1;
+    if (g_max_streams > MAX_STREAMS_CAP) g_max_streams = MAX_STREAMS_CAP;
     if (!have_encode) {
         fprintf(stderr, "No AMD/Intel VA-API encode on this host - encode requests will be rejected\n");
     }
