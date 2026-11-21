@@ -53,8 +53,14 @@
 #include "ratectl.h"
 #include "gop.h"
 
-#ifdef HAVE_HWDEC
+/* Always now (21/11/2026), not only with HAVE_HWDEC: every connection gets its own thread, see
+ * connection_thread() near the end of this file. */
 #include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
+#include <sys/time.h>
+
+#ifdef HAVE_HWDEC
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include "hwdec.h"
@@ -1027,7 +1033,17 @@ static void send_response(int conn_fd, int32_t status, const unsigned char *buf,
     }
 }
 
-static void handle_encode(vaapi_state_t *st, int have_encode, int conn_fd) {
+/* Serializes everything that touches the shared VA-API encode state (vaapi_state_t: context,
+ * surfaces, gop, g_rate_ctl, the ffmpeg backend, the legacy NVIDIA decode's static output buffer).
+ * Until 21/11/2026 that serialization came for free from serving every connection on the one
+ * accept() thread -- which also meant a client that connected and then stalled (never sent its
+ * request, or never read its response) blocked the encoder for every other instance on the host.
+ * Now each connection has its own thread, and only the GPU work itself runs under this lock:
+ * receiving the request and sending the response happen outside it, bounded by the socket
+ * timeouts set at accept time. */
+static pthread_mutex_t g_gpu_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void handle_encode(vaapi_state_t *st, int have_encode, int conn_fd, pid_t peer_pid) {
     EncodeRequest req;
     int dmabuf_fd = -1;
     if (recv_request(conn_fd, &req, &dmabuf_fd) != 0) {
@@ -1044,21 +1060,19 @@ static void handle_encode(vaapi_state_t *st, int have_encode, int conn_fd) {
     fprintf(stderr, "Request: %ux%u, stride_y=%u stride_uv=%u offset_uv=%u dmabuf_size=%u fd=%d\n",
             req.width, req.height, req.stride_y, req.stride_uv, req.offset_uv, req.dmabuf_size, dmabuf_fd);
 
-    struct ucred cred = {0};
-    socklen_t cred_len = sizeof(cred);
-    if (getsockopt(conn_fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) != 0) cred.pid = 0;
-
     unsigned char *out_buf = NULL;
     long n;
+    pthread_mutex_lock(&g_gpu_lock);
 #ifdef HAVE_HWDEC
-    if (g_backend_is_ffmpeg) n = encode_one_frame_ffmpeg(st, dmabuf_fd, &req, cred.pid, &out_buf);
+    if (g_backend_is_ffmpeg) n = encode_one_frame_ffmpeg(st, dmabuf_fd, &req, peer_pid, &out_buf);
     else
 #endif
-        n = encode_one_frame(st, dmabuf_fd, &req, cred.pid, &out_buf);
+        n = encode_one_frame(st, dmabuf_fd, &req, peer_pid, &out_buf);
+    if (n < 0) gop_reset(&st->gop);  /* the reference may be lost: the next frame is an IDR */
+    pthread_mutex_unlock(&g_gpu_lock);
     close(dmabuf_fd);
 
     if (n < 0) {
-        gop_reset(&st->gop);  /* the reference may be lost: the next frame is an IDR */
         send_response(conn_fd, -1, NULL, 0);
     } else {
         fprintf(stderr, "Encoded %ld bytes\n", n);
@@ -1126,10 +1140,14 @@ static void handle_decode(int have_decode, int conn_fd) {
     const uint8_t *out_data;
     size_t out_size;
     uint32_t out_width, out_height;
+    /* Held through the send: out_data points into decode_h264.c's own static buffer, which the
+     * next decode would overwrite. The send is bounded by the connection's SO_SNDTIMEO. */
+    pthread_mutex_lock(&g_gpu_lock);
     int rc = decode_h264_frame(bitstream, req.bitstream_size, &out_data, &out_size, &out_width,
                                &out_height);
     free(bitstream);
     if (rc != 0) {
+        pthread_mutex_unlock(&g_gpu_lock);
         send_decode_response(conn_fd, -1, NULL, 0);
         return;
     }
@@ -1140,6 +1158,7 @@ static void handle_decode(int have_decode, int conn_fd) {
     }
     fprintf(stderr, "Decoded %ux%u, %zu bytes NV12\n", out_width, out_height, out_size);
     send_decode_response(conn_fd, 0, out_data, (uint32_t)out_size);
+    pthread_mutex_unlock(&g_gpu_lock);
 }
 
 #ifdef HAVE_HWDEC
@@ -1490,8 +1509,14 @@ static void handle_hwdec_caps(int conn_fd) {
 }
 #endif /* HAVE_HWDEC */
 
-/* Returns 1 if the connection moves to another thread (which closes it), 0 if it has to be closed here. */
-static int handle_connection(vaapi_state_t *st, int have_encode, int have_decode, int conn_fd) {
+static void set_io_timeout(int fd, int ms) {
+    struct timeval tv = {.tv_sec = ms / 1000, .tv_usec = (ms % 1000) * 1000};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+/* Returns 1 if something else already closed the connection (the hwdec session does), 0 if the caller has to close it. */
+static int handle_connection(vaapi_state_t *st, int have_encode, int have_decode, int conn_fd, pid_t peer_pid) {
     VaapiCommand cmd;
     ssize_t n = read(conn_fd, &cmd, sizeof(cmd));
     if (n != (ssize_t)sizeof(cmd)) {
@@ -1501,21 +1526,18 @@ static int handle_connection(vaapi_state_t *st, int have_encode, int have_decode
     }
     switch (cmd) {
     case VAAPI_CMD_ENCODE:
-        handle_encode(st, have_encode, conn_fd);
+        handle_encode(st, have_encode, conn_fd, peer_pid);
         break;
     case VAAPI_CMD_DECODE:
         handle_decode(have_decode, conn_fd);
         break;
 #ifdef HAVE_HWDEC
-    case VAAPI_CMD_HWDEC: {
-        pthread_t t;
-        if (pthread_create(&t, NULL, hwdec_stream_thread, (void *)(intptr_t)conn_fd) != 0) {
-            perror("pthread_create(hwdec)");
-            return 0;
-        }
-        pthread_detach(t);
+    case VAAPI_CMD_HWDEC:
+        /* Already on this connection's own thread (connection_thread): the session just runs here. It is a long-lived
+         * stream that legitimately sits idle between access units, so the per-request I/O timeout does not apply. */
+        set_io_timeout(conn_fd, 0);
+        hwdec_stream_thread((void *)(intptr_t)conn_fd);
         return 1;
-    }
     case VAAPI_CMD_HWDEC_CAPS:
         handle_hwdec_caps(conn_fd);
         break;
@@ -1532,8 +1554,140 @@ static int handle_connection(vaapi_state_t *st, int have_encode, int have_decode
     return 0;
 }
 
+/* ------------------------------------------------------------------ *
+ * Connection isolation (21/11/2026). Before: every connection was served start to finish on the
+ * accept() thread, with no timeouts -- one client that connected and stalled froze encode for
+ * every instance on the host, and one instance flooding requests (seen live on prod: an instance
+ * in a broken loop at ~87 req/s left the others without a turn) had no limit at all.
+ * Now: one detached thread per connection, socket timeouts on every request/response, a cap on
+ * simultaneous connections, and a per-process circuit breaker.
+ * ------------------------------------------------------------------ */
+static vaapi_state_t *g_st;
+static int g_have_encode, g_have_decode;
+static atomic_int g_active_conns;
+
+static int env_int(const char *name, int def) {
+    const char *v = getenv(name);
+    return (v && *v) ? atoi(v) : def;
+}
+static int g_io_timeout_ms;   /* REDROID_FORGE_DAEMON_IO_TIMEOUT_MS, default 5000 */
+static int g_max_conns;       /* REDROID_FORGE_DAEMON_MAX_CONNECTIONS, default 64 */
+
+
+/* Per-process circuit breaker. Every encode is one connection (one frame), and the peer is the instance's Codec2 service
+ * process (SO_PEERCRED; host PIDs, since the forge shares the host's PID namespace), so connections per second per PID is
+ * frames per second per instance. A real 60 fps scrcpy stream is at most 60/s, and two viewers of the same instance about
+ * 120/s -- hence the default limit of 150/s, sustained for 3 whole seconds before it trips. Tripping drops that process's
+ * connections for a cooldown that starts at 5 s and doubles up to 60 s on repeat offences (reset after 5 min of good
+ * behavior). Only this accept() thread touches the table, so it needs no lock. 0 disables it. */
+#define RL_SLOTS 128
+#define NS_PER_S 1000000000LL
+#define RL_COOLDOWN_MIN (5 * NS_PER_S)
+#define RL_COOLDOWN_MAX (60 * NS_PER_S)
+#define RL_FORGIVE_AFTER (300 * NS_PER_S)
+typedef struct {
+    pid_t pid;
+    int64_t win_start, last_seen, blocked_until, unblocked_at, cooldown;
+    uint32_t count, over, dropped;
+    /* Connections of this PID open right now. Written by the connection threads too (hence atomic): without a per-PID cap,
+     * one process opening many connections and stalling on all of them could take every one of the global slots for up
+     * to the I/O timeout and leave every other instance refused. */
+    atomic_int active;
+} RateSlot;
+static RateSlot g_rl[RL_SLOTS];
+static int g_max_per_pid;  /* REDROID_FORGE_DAEMON_MAX_CONNECTIONS_PER_PID, default 16 */
+static int g_rl_max_rps;   /* REDROID_FORGE_DAEMON_MAX_RPS, default 150 */
+static int g_rl_sustain;   /* REDROID_FORGE_DAEMON_RPS_SUSTAIN_S, default 3 */
+
+static RateSlot *rl_slot(pid_t pid, int64_t now) {
+    RateSlot *oldest = NULL;
+    for (int i = 0; i < RL_SLOTS; i++) {
+        if (g_rl[i].pid == pid) return &g_rl[i];
+        /* Never recycle a slot whose connections are still open (their threads still count on it). */
+        if (atomic_load(&g_rl[i].active) == 0 && (!oldest || g_rl[i].last_seen < oldest->last_seen)) oldest = &g_rl[i];
+    }
+    if (!oldest) return NULL;  /* 128 PIDs with open connections at once: not tracked, the global cap still applies */
+    memset(oldest, 0, sizeof(*oldest));  /* a new PID takes the least recently seen slot */
+    oldest->pid = pid;
+    oldest->win_start = now;
+    oldest->cooldown = RL_COOLDOWN_MIN;
+    return oldest;
+}
+
+/* 1 = serve this connection, 0 = drop it. *out_slot = the PID's slot (NULL if not tracked). */
+static int rl_admit(pid_t pid, RateSlot **out_slot) {
+    *out_slot = NULL;
+    if (pid <= 0) return 1;
+    const int64_t now = now_ns();
+    RateSlot *s = rl_slot(pid, now);
+    if (!s) return 1;
+    *out_slot = s;
+    s->last_seen = now;
+    if (g_max_per_pid > 0 && atomic_load(&s->active) >= g_max_per_pid) {
+        static int64_t last_log;
+        if (now - last_log > NS_PER_S) {
+            fprintf(stderr, "connections: pid %d already has %d open (max %d per process), refusing\n", (int)pid,
+                    atomic_load(&s->active), g_max_per_pid);
+            last_log = now;
+        }
+        return 0;
+    }
+    if (g_rl_max_rps <= 0) return 1;
+    if (s->blocked_until) {
+        if (now < s->blocked_until) { s->dropped++; return 0; }
+        fprintf(stderr, "rate-limit: pid %d allowed again (%u connections dropped while blocked)\n", (int)pid, s->dropped);
+        s->blocked_until = 0;
+        s->unblocked_at = now;
+        s->dropped = s->count = s->over = 0;
+        s->win_start = now;
+    }
+    if (now - s->win_start >= NS_PER_S) {
+        /* A window counts as "over" only if it really was the previous second (not a gap of silence). */
+        const int over = s->count > (uint32_t)g_rl_max_rps && now - s->win_start < 2 * NS_PER_S;
+        s->over = over ? s->over + 1 : 0;
+        if (!over && s->cooldown > RL_COOLDOWN_MIN && s->unblocked_at && now - s->unblocked_at > RL_FORGIVE_AFTER)
+            s->cooldown = RL_COOLDOWN_MIN;
+        const uint32_t last_count = s->count;
+        s->count = 0;
+        s->win_start = now;
+        if (s->over >= (uint32_t)g_rl_sustain) {
+            s->blocked_until = now + s->cooldown;
+            fprintf(stderr, "rate-limit: pid %d sent %u req/s for %u s (limit %d/s): blocked for %lld s\n", (int)pid,
+                    last_count, s->over, g_rl_max_rps, (long long)(s->cooldown / NS_PER_S));
+            s->cooldown = s->cooldown * 2 > RL_COOLDOWN_MAX ? RL_COOLDOWN_MAX : s->cooldown * 2;
+            s->over = 0;
+            s->dropped = 1;
+            return 0;
+        }
+    }
+    s->count++;
+    return 1;
+}
+
+typedef struct { int fd; pid_t pid; RateSlot *slot; } ConnArg;
+
+static void *connection_thread(void *arg) {
+    ConnArg a = *(ConnArg *)arg;
+    free(arg);
+    if (!handle_connection(g_st, g_have_encode, g_have_decode, a.fd, a.pid)) close(a.fd);
+    if (a.slot) atomic_fetch_sub(&a.slot->active, 1);
+    atomic_fetch_sub(&g_active_conns, 1);
+    return NULL;
+}
+
 int main(void) {
     setvbuf(stderr, NULL, _IONBF, 0);
+
+    /* 21/11/2026: a client that hangs up while we write its response raised SIGPIPE, whose default action terminates the
+     * WHOLE daemon -- one instance closing early cut the encoder for every instance until the supervisor relaunched it.
+     * Ignored, a write to a closed peer just fails with EPIPE, which every write() here already handles. */
+    signal(SIGPIPE, SIG_IGN);
+    g_io_timeout_ms = env_int("REDROID_FORGE_DAEMON_IO_TIMEOUT_MS", 5000);
+    g_max_conns = env_int("REDROID_FORGE_DAEMON_MAX_CONNECTIONS", 64);
+    g_rl_max_rps = env_int("REDROID_FORGE_DAEMON_MAX_RPS", 150);
+    g_rl_sustain = env_int("REDROID_FORGE_DAEMON_RPS_SUSTAIN_S", 3);
+    g_max_per_pid = env_int("REDROID_FORGE_DAEMON_MAX_CONNECTIONS_PER_PID", 16);
+    if (g_rl_sustain < 1) g_rl_sustain = 1;
 
     /* Must happen before any Mesa entry point runs at all (vaInitialize
      * included) -- see rgba_modifier_init()'s comment for why. */
@@ -1626,11 +1780,22 @@ int main(void) {
         return 1;
     }
     chmod(socket_path, 0666);
-    if (listen(listen_fd, 4) != 0) {
+    /* 64, not 4: connections are handed to their own thread right away now, so a burst from several instances at once
+     * should queue briefly instead of being refused. */
+    if (listen(listen_fd, 64) != 0) {
         perror("listen");
         return 1;
     }
-    fprintf(stderr, "Listening on %s\n", socket_path);
+    fprintf(stderr, "Listening on %s (io timeout %d ms, max %d connections, %d per process, rate limit %d req/s per process)\n",
+            socket_path, g_io_timeout_ms, g_max_conns, g_max_per_pid, g_rl_max_rps);
+
+    g_st = &st;
+    g_have_encode = have_encode;
+    g_have_decode = have_decode;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    int64_t last_full_log = 0;
 
     while (1) {
         int conn_fd = accept(listen_fd, NULL, NULL);
@@ -1639,7 +1804,42 @@ int main(void) {
             perror("accept");
             break;
         }
-        if (!handle_connection(&st, have_encode, have_decode, conn_fd)) close(conn_fd);
+        struct ucred cred = {0};
+        socklen_t cred_len = sizeof(cred);
+        if (getsockopt(conn_fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) != 0) cred.pid = 0;
+
+        RateSlot *slot;
+        if (!rl_admit(cred.pid, &slot)) {
+            close(conn_fd);
+            continue;
+        }
+        if (atomic_load(&g_active_conns) >= g_max_conns) {
+            const int64_t now = now_ns();
+            if (now - last_full_log > NS_PER_S) {
+                fprintf(stderr, "connections: %d already open (max %d), refusing pid %d\n", atomic_load(&g_active_conns),
+                        g_max_conns, (int)cred.pid);
+                last_full_log = now;
+            }
+            close(conn_fd);
+            continue;
+        }
+        if (g_io_timeout_ms > 0) set_io_timeout(conn_fd, g_io_timeout_ms);
+
+        ConnArg *a = malloc(sizeof(*a));
+        if (!a) { close(conn_fd); continue; }
+        a->fd = conn_fd;
+        a->pid = cred.pid;
+        a->slot = slot;
+        atomic_fetch_add(&g_active_conns, 1);
+        if (slot) atomic_fetch_add(&slot->active, 1);
+        pthread_t t;
+        if (pthread_create(&t, &attr, connection_thread, a) != 0) {
+            perror("pthread_create(connection)");
+            atomic_fetch_sub(&g_active_conns, 1);
+            if (slot) atomic_fetch_sub(&slot->active, 1);
+            free(a);
+            close(conn_fd);
+        }
     }
 
     close(listen_fd);

@@ -14,7 +14,7 @@
 # running redroid-forge's Doctor against a freshly built image.
 CC ?= gcc
 CFLAGS ?= -O2 -Wall -D_FORTIFY_SOURCE=0
-LDLIBS := -lva -lva-drm -lgbm -lEGL -ldl -lm
+LDLIBS := -lva -lva-drm -lgbm -lEGL -ldl -lm -lpthread
 
 # The Makefile as its own prerequisite: without this, changing CFLAGS (e.g. the
 # _FORTIFY_SOURCE fix above) does not trigger a recompilation if the binary already
