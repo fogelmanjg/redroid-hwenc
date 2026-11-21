@@ -912,7 +912,25 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
     vaRenderPicture(st->dpy, st->context_id, b5, 2);
     VABufferID b6[] = {slice_buf};
     vaRenderPicture(st->dpy, st->context_id, b6, 1);
-    CHECK_VA(vaEndPicture(st->dpy, st->context_id), "vaEndPicture");
+    VAStatus end_status = vaEndPicture(st->dpy, st->context_id);
+
+    /* 21/11/2026: THE memory leak. Every parameter/packed-header buffer created above for this frame (3 to 9 of
+     * them) was never destroyed -- only coded_buf was. Mesa (radeonsi) does not free buffers on vaRenderPicture/
+     * vaEndPicture, so the daemon grew ~27 KB per encoded frame and never gave it back (measured on the dev forge:
+     * 53 -> 167 MB over 3.9k frames; prod reached 3-4.5 GB in 12-17 h). After vaEndPicture the driver has consumed
+     * them (the libva contract), so they go now -- also on an error path. */
+    vaDestroyBuffer(st->dpy, seq_buf);
+    vaDestroyBuffer(st->dpy, pic_buf);
+    vaDestroyBuffer(st->dpy, slice_buf);
+    vaDestroyBuffer(st->dpy, slice_hdr_param_buf);
+    vaDestroyBuffer(st->dpy, slice_hdr_data_buf);
+    if (gd.is_idr) {
+        vaDestroyBuffer(st->dpy, sps_param_buf);
+        vaDestroyBuffer(st->dpy, sps_data_buf);
+        vaDestroyBuffer(st->dpy, pps_param_buf);
+        vaDestroyBuffer(st->dpy, pps_data_buf);
+    }
+    CHECK_VA(end_status, "vaEndPicture");
     CHECK_VA(vaSyncSurface(st->dpy, st->surfaces[2]), "vaSyncSurface");
 
     free(sps_bs.buf);
