@@ -2103,3 +2103,16 @@ details in `tier5-vaapi-daemon/README.md` section 5.17.
   when a client hung up early (reproduced: 200 early hang-ups kill v0.2.0's daemon, not this one).
   A first draft of the rate limit used ~10 req/s from an earlier, near-idle measurement; one frame
   is one request, so a real stream is up to 60/s -- the default is 150/s, sustained 3 s.
+
+## 22/11/2026 -- v0.4.0: stream_id for the Android 11-13 HIDL component (Tier 8)
+
+v0.3.0 gave the daemon one encoder per (process, stream_id), but only the Android 15 (AIDL)
+component sent a stream_id; Tier 8's HIDL port still sent 0, so two viewers of the same Android 11
+instance kept crossing P-frame references. The HIDL VaapiEncComponent now does what the AIDL one
+does: a random non-zero stream_id per session (onInit/onReset), sent in EncodeRequest.stream_id;
+its protocol.h is now the daemon's own (tier5-vaapi-daemon/protocol.h). Built in the Android 11
+redroid tree (`m android.hardware.media.c2@1.1-vaapi-service`, 2.5 min): only the service binary
+changed in the artifact set. Verified on a redroid-forge instance created from the official
+Android 11 image with hwenc: two simultaneous recordings got two encoder slots (distinct stream_ids
+from the same Codec2 process), both decode clean with P frames (~500 frames each, 5 I).
+The daemon is unchanged from v0.3.0.

@@ -4,11 +4,14 @@
 #include "VaapiEncComponent.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <time.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <string>
 
 #include <log/log.h>
@@ -122,7 +125,27 @@ VaapiEncComponent::VaapiEncComponent(const char *name, c2_node_id_t id,
     : SimpleC2Component(std::make_shared<SimpleInterface<VaapiEncInterface>>(name, id, intf)),
       mIntf(intf) {}
 
+// Same as the AIDL component (redroid-forge's android/vaapi_codec2): random, so ids from
+// different instances/sessions do not collide by construction (the daemon keys on (pid, id)
+// anyway); a time+counter mix if /dev/urandom cannot be read.
+uint32_t VaapiEncComponent::newStreamId() {
+    static std::atomic<uint32_t> counter{0};
+    uint32_t id = 0;
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        if (read(fd, &id, sizeof(id)) != (ssize_t)sizeof(id)) id = 0;
+        close(fd);
+    }
+    if (id == 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        id = (uint32_t)ts.tv_nsec ^ ((uint32_t)ts.tv_sec << 16) ^ (++counter * 2654435761u);
+    }
+    return id ? id : 1;
+}
+
 c2_status_t VaapiEncComponent::onInit() {
+    mStreamId = newStreamId();
     return C2_OK;
 }
 
@@ -132,6 +155,7 @@ c2_status_t VaapiEncComponent::onStop() {
 
 void VaapiEncComponent::onReset() {
     mCsdSent = false;
+    mStreamId = newStreamId();
 }
 
 void VaapiEncComponent::onRelease() {}
@@ -184,6 +208,7 @@ long VaapiEncComponent::encodeViaDaemon(int dmabufFd, uint32_t width, uint32_t h
     req.dmabuf_size = dmabufSize;
     req.drm_format_modifier = drmFormatModifier;
     req.bitrate = mIntf->bitrate();
+    req.stream_id = mStreamId;
 
     char cmsgBuf[CMSG_SPACE(sizeof(int))];
     struct iovec iov = {.iov_base = &req, .iov_len = sizeof(req)};

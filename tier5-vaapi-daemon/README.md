@@ -289,8 +289,8 @@ Found running redroid-forge with several viewers at once (21/11/2026); all three
   `EncodeRequest.reserved` is now `stream_id`, chosen by the Android component per encoder session,
   and every (pid, stream_id) gets its own slot -- context, surfaces, reference, rate control --
   exactly like N independent encoders. Slots are freed after 30 s without frames, LRU when all are
-  busy. A component that sends 0 (older builds, and Tier 8's HIDL port for now) gets one slot per
-  process: still correct across instances, but two viewers of one such instance stay broken. The
+  busy. A component that sends 0 (builds older than v0.3.0 for Android 15, older than v0.4.0 for
+  Tier 8's HIDL port) gets one slot per process: still correct across instances, but two viewers of one such instance stay broken. The
   ffmpeg backend (5.16) still has one libavcodec encoder, so a stream change forces an IDR there.
 - **Connection isolation.** Every connection used to be served start to finish on the `accept()`
   thread with no timeouts: one client that connected and stalled froze encode for every instance,

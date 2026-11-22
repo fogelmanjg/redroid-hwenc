@@ -96,7 +96,12 @@ typedef struct {
      * average (ratectl.h). With 0 it keeps its historical fixed QP. A request WITHOUT these last
      * 8 bytes (an older Android component, EncodeRequestV1 in size) is accepted as 0. */
     uint32_t bitrate;
-    uint32_t reserved;
+    /* Identifies the encoder (one MediaCodec session) this frame belongs to, chosen by the Android
+     * component when the session starts (21/11/2026; this was `reserved`, always sent as 0). The
+     * daemon keeps one encoder state per (process, stream_id) -- context, reference frames, rate
+     * control -- so two viewers of the same instance are two independent encoders instead of one
+     * stream with crossed P-frame references. 0 = an older component: one state per process. */
+    uint32_t stream_id;
 } EncodeRequest;
 
 /* Size of EncodeRequest before `bitrate` existed. */
